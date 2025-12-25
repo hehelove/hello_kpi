@@ -1,0 +1,411 @@
+syntax = "proto2";
+package apollo.control;
+
+// MPC轨迹调试信息 - 包含纵向和横向调试信息
+message MPCTrajectoryDebug {
+  optional LongDebug long_debug = 1;                 // 纵向调试信息
+  optional LatDebug lat_debug = 2;                   // 横向调试信息
+  optional double ComputerTime = 3;
+  optional double local_delay_loc = 4;
+  optional double local_delay_plan = 5;
+  optional double local_delay_chassis = 6;
+}
+
+// 纵向MPC调试信息
+message LongDebug {
+  // MPC基本参数
+  optional int32 prediction_horizon = 1;        // 预测时域 Np
+  optional double control_horizon = 2;           // 控制时域 Nc  
+  optional double time_step = 3;                // 时间步长 (秒)
+  optional int32 state_dimension = 4;          // 状态维度 (s, v, a)
+  
+  // 当前车辆状态
+  optional double current_s = 5;                // 当前位置
+  optional double current_speed = 6;            // 当前速度
+  optional double current_acceleration = 7;     // 当前加速度
+  
+  // Planning模块给的原始参考轨迹点 (上游输入)
+  message PlanningReferencePoint {
+    optional double time = 1;                  // 时间戳
+    optional double s = 2;                     // 位置
+    optional double v = 3;                     // 速度
+    optional double a = 4;                     // 加速度
+    optional double x = 5;                     // 全局x坐标
+    optional double y = 6;                     // 全局y坐标
+    optional double theta = 7;                 // 航向角
+    optional double kappa = 8;                 // 曲率
+    optional double relative_time = 9;         // 相对时间
+  }
+  
+  repeated PlanningReferencePoint planning_reference_points = 9;  // Planning原始参考轨迹点序列
+  
+  // MPC选取的参考轨迹点 (经过轨迹分析器处理)
+  message MPCReferencePoint {
+    optional double time = 1;                  // 时间戳
+    optional double s = 2;                     // 位置
+    optional double v = 3;                     // 速度
+    optional double a = 4;                     // 加速度
+    optional double x = 5;                     // 全局x坐标
+    optional double y = 6;                     // 全局y坐标
+    optional double theta = 7;                 // 航向角
+    optional double kappa = 8;                 // 曲率
+  }
+  
+  repeated MPCReferencePoint mpc_reference_points = 10;  // MPC选取的参考轨迹点序列
+  
+  // MPC预测轨迹点 (完整序列)
+  message PredictionPoint {
+    optional double time = 1;                  // 时间戳
+    optional double s = 2;                     // 预测位置
+    optional double v = 3;                     // 预测速度
+    optional double a = 4;                     // 预测加速度
+    optional double control_input = 5;         // 控制输入
+  }
+  
+  repeated PredictionPoint prediction_points = 11;  // 预测轨迹点序列
+  
+  // 轨迹差值信息 (完整序列)
+  message TrajectoryError {
+    optional double time = 1;                  // 时间戳
+    optional double s_error = 2;               // 位置误差 (MPC - 参考)
+    optional double v_error = 3;               // 速度误差 (MPC - 参考)
+    optional double a_error = 4;               // 加速度误差 (MPC - 参考)
+  }
+  
+  repeated TrajectoryError trajectory_errors = 12;  // 轨迹误差序列
+  
+  // MPC求解器状态
+  optional int32 solver_status = 13;          // 求解状态
+  optional double solver_run_time = 14;        // 求解时间 (ms)
+  optional bool is_warm_start = 15;            // 是否热启动
+  optional int32 iteration_count = 16;         // 迭代次数
+  
+  // 控制输出
+  optional double acceleration_command = 17;   // 最终加速度命令
+  optional double control_input = 18;          // 控制输入
+  optional double jerk_command = 19;           // 加加速度命令
+  
+  // 约束信息
+  optional double acceleration_limit = 20;     // 加速度限制
+  optional double deceleration_limit = 21;    // 减速度限制
+  optional double jerk_limit = 22;             // 加加速度限制
+  
+  // 权重参数
+  optional double position_weight = 23;        // 位置权重
+  optional double velocity_weight = 24;        // 速度权重
+  optional double acceleration_weight = 25;    // 加速度权重
+  optional double control_weight = 26;         // 控制权重
+  
+  // Observer输入信息
+  message ObserverInput {
+    optional double vx_meas_chassis_mps = 1;        // 底盘测量速度
+    optional double vx_meas_cog_mps = 2;            // 质心测量速度
+    optional double ax_meas_chassis_mps2 = 3;       // 底盘测量纵向加速度
+    optional double ax_cmd_mps2 = 4;                // 纵向加速度命令
+    optional double ay_meas_cog_mps2 = 5;           // 质心测量横向加速度
+    optional double yawrate_meas_chassis_radps = 6; // 底盘测量横摆角速度
+    optional double pinion_angle_rad = 7;            // 转向盘角度
+    optional bool not_slipping = 8;                 // 是否不打滑
+    optional bool is_fs_mode = 9;                   // 是否前驱模式
+  }
+  
+  optional ObserverInput observer_input = 27;        // Observer输入信息
+  
+  // Observer输出信息
+  message ObserverOutput {
+    optional bool is_valid_flag = 1;                 // 是否有效标志
+    optional double acc_hat_mps2 = 2;               // 估计加速度
+    optional double speed_diff_lpf_mps2 = 3;        // 速度差低通滤波
+    optional double acc_imu_lpf_mps2 = 4;           // IMU加速度低通滤波
+    optional double acc_imu_hpf_mps2 = 5;           // IMU加速度高通滤波
+  }
+  
+  optional ObserverOutput observer_output = 28;      // Observer输出信息
+  
+  // 加速度扰动观测器输出
+  message AccDisturbanceObserverOutput {
+    optional bool is_valid_flag = 1;                 // 是否有效标志
+    optional double acc_dob_u_mps2 = 2;              // 扰动观测器控制量
+    optional double acc_dob_y_mps = 3;               // 扰动观测器输出
+    optional double filtered_chassis_speed_mps = 4;  // 滤波后底盘速度
+    optional double acc_rate_limiter_mps2 = 5;       // 加速度率限制器
+    optional double acc_td_lpf_mps2 = 6;            // 加速度TD低通滤波
+    optional double acc_lpf_mps2 = 7;               // 加速度低通滤波
+    optional double acc_integral_speed_mps = 8;     // 加速度积分速度
+  }
+  
+  optional AccDisturbanceObserverOutput acc_disturbance_observer_output = 29;  // 加速度扰动观测器输出
+  
+  // 横摆角速度观测器输出
+  message YawrateObserverOutput {
+    optional double sideslip_angle_hat_rad = 1;     // 估计侧滑角
+    optional double yawrate_hat_radps = 2;          // 估计横摆角速度
+  }
+  
+  optional YawrateObserverOutput yawrate_observer_output = 30;  // 横摆角速度观测器输出
+  
+  // 时间戳
+  optional double timestamp = 31;                    // 消息时间戳
+  optional double current_s_error = 32;
+  optional double current_v_error = 33;
+  optional double current_a_error = 34;
+}
+
+// 横向调试信息
+message LatDebug {
+  // 顶层调试信息
+  optional double preview_time = 1;                    // 预览时间
+  optional double vehicle_speed = 2;                  // 车辆速度
+  optional double nearest_lateral_error = 3;            // 最近横向误差
+  optional double nearest_heading_error = 4;          // 最近航向误差
+  optional double lateral_error = 5;                   // 横向误差
+  optional double heading_error = 6;                  // 航向误差
+  optional double ref_kappa = 7;                      // 参考曲率
+  optional double preview_dist = 8;                   // 预览距离
+  optional double observer_output_yawrate_hat_radps = 9; // 观测器输出横摆角速度
+  optional double curr_yaw_rate_filter = 10;          // 当前横摆角速度滤波
+  optional double final_ref_yaw_rate = 11;            // 最终参考横摆角速度
+  optional double lmpc_ref_yaw_rate = 12;           // LMPC参考横摆角速度
+  optional double ref_yaw_rate_from_lmpc = 13;      // 来自LMPC的参考横摆角速度
+  optional double kinematic_ref_yaw_rate = 14;       // 运动学参考横摆角速度
+  optional double front_wheel_angle_req = 15;        // 前轮转角请求
+  optional double tmp_feedforward_out = 16;          // 临时前馈输出
+  optional double dynamic_feedback_out = 17;         // 动力学反馈输出
+  
+  // LMPC调试信息
+  message LMpcDebug {
+    // LMPC基本参数
+    optional int32 prediction_horizon = 1;            // 预测时域
+    optional double model_discrete_time = 2;         // 模型离散时间
+    optional double ts = 3;                           // 控制周期
+    optional bool lmpc_active = 4;                   // LMPC是否激活
+    optional bool algorithm_failed = 5;               // 算法是否失败
+    optional bool first_run = 6;                      // 是否首次运行
+    
+    // 当前车辆状态
+    optional double current_control_time = 7;         // 当前控制时间
+    
+    optional double current_speed = 8;                // 当前速度
+    optional double current_yaw_rate = 9;            // 当前横摆角速度
+    optional double current_front_wheel_angle = 10;   // 当前前轮转角
+    optional double current_lateral_speed = 11;       // 当前横向速度
+    optional double last_heading_rate_cmd = 12;      // 上次航向角速度命令
+    
+    // 滤波后的车辆状态
+    optional double filtered_speed = 13;              // 滤波后速度
+    optional double filtered_yaw_rate = 14;          // 滤波后横摆角速度
+    optional double filtered_front_wheel_angle = 15; // 滤波后前轮转角
+    optional double filtered_lateral_speed = 16;     // 滤波后横向速度
+    
+    // 车辆位置信息
+    optional double vehicle_x = 17;                   // 车辆x坐标
+    optional double vehicle_y = 18;                   // 车辆y坐标
+    optional double vehicle_heading = 19;             // 车辆航向角
+    
+    // 跟踪误差
+    optional double station_error = 20;              // 纵向误差
+    optional double lateral_error = 21;              // 横向误差
+    optional double speed_error = 22;                 // 速度误差
+    optional double heading_error = 23;               // 航向误差
+    
+    // LMPC选取的参考轨迹点 (完整序列)
+    message LMPCReferencePoint {
+      optional double time = 1;                      // 时间戳
+      optional double x = 2;                         // 参考x坐标
+      optional double y = 3;                         // 参考y坐标
+      optional double heading = 4;                   // 参考航向角
+      optional double heading_rate = 5;              // 参考航向角速度
+      optional double speed = 6;                     // 参考速度
+      optional double lateral_speed = 7;             // 参考横向速度
+      optional double front_wheel_angle = 8;        // 参考前轮转角
+      optional double acceleration = 9;              // 参考加速度
+      optional double kappa = 10;                    // 参考曲率
+    }
+    
+    repeated LMPCReferencePoint lmpc_reference_points = 24;  // LMPC参考轨迹点序列
+    
+    // LMPC预测轨迹点 (完整序列)
+    message LMPCPredictionPoint {
+      optional double time = 1;                      // 时间戳
+      optional double x = 2;                         // 预测x坐标
+      optional double y = 3;                         // 预测y坐标
+      optional double heading = 4;                   // 预测航向角
+      optional double heading_rate = 5;              // 预测航向角速度
+      optional double control_input = 6;             // 控制输入
+    }
+    
+    repeated LMPCPredictionPoint lmpc_prediction_points = 25;  // LMPC预测轨迹点序列
+    
+    // 轨迹误差信息 (完整序列)
+    message LMPCTrajectoryError {
+      optional double time = 1;                      // 时间戳
+      optional double x_error = 2;                   // x坐标误差 (预测 - 参考)
+      optional double y_error = 3;                   // y坐标误差 (预测 - 参考)
+      optional double heading_error = 4;             // 航向角误差 (预测 - 参考)
+      optional double heading_rate_error = 5;        // 航向角速度误差 (预测 - 参考)
+    }
+    
+    repeated LMPCTrajectoryError lmpc_trajectory_errors = 26;  // LMPC轨迹误差序列
+    
+    // LMPC求解器状态
+    optional int32 solver_status = 27;               // 求解状态
+    optional double solver_run_time = 28;            // 求解时间 (ms)
+    optional bool is_warm_start = 29;                // 是否热启动
+    optional int32 iteration_count = 30;             // 迭代次数
+    
+    // 控制输出
+    optional double heading_rate_command = 31;       // 航向角速度命令
+    optional double control_input = 32;              // 控制输入
+    optional double temp_factor = 33;                // 时间因子 (ts/model_discrete_time)
+    
+    // 约束信息
+    optional double lateral_acc_bound = 34;          // 横向加速度限制
+    optional double lateral_jerk_bound = 35;        // 横向加加速度限制
+    optional double lateral_boundary = 36;           // 横向边界
+    
+    // 权重参数
+    optional double matrix_q_coeff = 37;              // Q矩阵系数
+    optional double matrix_r_coeff = 38;             // R矩阵系数
+    optional double terminal_penalty_coeff = 39;     // 终端惩罚系数
+    
+    // 衰减系数
+    optional double ref_vy_decay_coeff = 40;          // 参考横向速度衰减系数
+    optional double ref_heading_rate_decay_coeff = 41; // 参考航向角速度衰减系数
+    
+    // 预览机制
+    optional int32 heading_rate_preview_index = 42;   // 航向角速度预览索引
+    
+    // 位置匹配点信息
+    optional double position_match_x = 43;            // 位置匹配点x坐标
+    optional double position_match_y = 44;           // 位置匹配点y坐标
+    optional double position_match_heading = 45;     // 位置匹配点航向角
+    optional double position_match_speed = 46;       // 位置匹配点速度
+    optional double position_match_kappa = 47;       // 位置匹配点曲率
+    
+    // 时间戳
+    optional double timestamp = 48;                   // 消息时间戳
+  }
+  
+  optional LMpcDebug lmpc_debug = 18;                // LMPC调试信息
+  
+  // 运动学调试信息
+  message KinematicsDebug {
+    // 参数配置
+    message ParaConfig {
+      optional double mass = 1;                    // 质量
+      optional double lf = 2;                     // 前轴到质心距离
+      optional double lr = 3;                     // 后轴到质心距离
+      optional double iz = 4;                     // 转动惯量
+      optional double kinematic_pole = 5;          // 运动学极点
+      optional double kinematic_rho = 6;          // 运动学rho
+      optional double kinematic_sigma = 7;        // 运动学sigma
+      optional double kinematic_epsion = 8;       // 运动学epsion
+      optional double kinematic_ff_gain = 9;       // 运动学前馈增益
+      optional double dynamic_k = 10;             // 动力学k
+      optional double dynamic_pole = 11;          // 动力学极点
+      optional double dynamic_zero = 12;           // 动力学零点
+      optional double dynamic_ff_gain = 13;       // 动力学前馈增益
+      optional double dynamic_ki = 14;            // 动力学积分增益
+      optional double max_dynamic_integration_limit = 15;  // 最大动力学积分限制
+    }
+    
+    optional ParaConfig para_config = 1;          // 参数配置
+    
+    // KDC调试信息
+    message KdcDebugInfo {
+      optional double raw_speed = 1;               // 原始速度
+      optional double raw_yaw_rate = 2;            // 原始横摆角速度
+      optional double raw_ref_kappa = 3;           // 原始参考曲率
+      optional double raw_lateral_error = 4;       // 原始横向误差
+      optional double raw_heading_error = 5;      // 原始航向误差
+      optional double speed_filter = 6;            // 速度滤波
+      optional double yaw_rate_filter = 7;         // 横摆角速度滤波
+      optional double ref_kappa_filter = 8;       // 参考曲率滤波
+      optional double lateral_error_filter = 9;    // 横向误差滤波
+      optional double heading_error_filter = 10;   // 航向误差滤波
+      optional double ref_yaw_rate = 11;          // 参考横摆角速度
+      optional double front_wheel_angle_req = 12;  // 前轮转角请求
+      optional double front_wheel_angle_cmd = 13;  // 前轮转角命令
+      optional bool kinematic_active = 14;         // 运动学激活
+      optional bool dynamic_active = 15;           // 动力学激活
+      optional double raw_nearest_lateral_error = 16;  // 原始最近横向误差
+      optional double raw_nearest_heading_error = 17;  // 原始最近航向误差
+      optional double preview_dist = 18;           // 预览距离
+      optional bool integration_active = 19;       // 积分激活
+      optional double steer_angle_cmd_rate_limiter = 20;
+    }
+    
+    optional KdcDebugInfo kdc_debug_info = 2;      // KDC调试信息
+    
+    // 横向参考点
+    message LatRefePoint {
+      optional double vehicle_x = 1;               // 车辆x坐标
+      optional double vehicle_y = 2;              // 车辆y坐标
+      optional double vehicle_heading = 3;        // 车辆航向角
+      optional double nearest_x = 4;             // 最近点dx
+      optional double nearest_y = 5;             // 最近点dy
+      optional double nearest_theta = 6;       // 最近点(theta)
+      optional double nearest_heading_error = 7;      
+      optional double nearest_lateral_error = 8; 
+      optional double preview_point_x = 9;
+      optional double preview_point_y = 10;
+      optional double preview_point_kappa = 11;
+      optional double nearest_index = 12;
+    }
+    
+    optional LatRefePoint lat_refe_point = 3;     // 横向参考点
+    
+    // 计算机调试信息
+    message ComputerDebug {
+      optional double u = 1;                       // 控制量u
+      optional double u_kinematic_feedback = 2;    // 运动学反馈控制量
+      optional double u_kinematic_feedforward = 3; // 运动学前馈控制量
+      optional double ueq_known = 4;               // 已知等效控制量
+      optional double c1_term = 5;                 // c1项
+      optional double c2_term = 6;                // c2项
+      optional double c3_term = 7;                // c3项
+      optional double s_surface = 8;              // s面
+      optional double s = 9;                       // s值
+      optional double kinematic_ff_gain = 10;      // 运动学前馈增益
+      optional double ref_kappa_filter = 11;      // 参考曲率滤波
+    }
+    
+    optional ComputerDebug computer_debug = 4;     // 计算机调试信息
+  }
+  
+  optional KinematicsDebug kinematics_debug = 19;   // 运动学调试信息
+  
+  // 动力学控制器调试信息
+  message DynamicControllerDebug {
+    optional double ref_yaw_rate_bound = 1;        // 参考横摆角速度边界
+    optional double ref_yaw_rate_limit = 2;        // 参考横摆角速度限制
+    optional double ref_yaw_rate_limit_filter = 3; // 参考横摆角速度限制滤波
+    optional double curr_yaw_rate_filter = 4;      // 当前横摆角速度滤波
+    optional double front_wheel_angle_req = 5;     // 前轮转角请求
+    optional double dynamic_feedback = 6;          // 动力学反馈
+    optional double dynamic_feedback_out = 7;      // 动力学反馈输出
+    optional double tmp_feedforward = 8;          // 临时前馈
+    optional double tmp_feedforward_out = 9;       // 临时前馈输出
+    optional double kinematic_feedforward = 10;    // 运动学前馈
+    optional double dynamic_feedforward = 11;      // 动力学前馈
+    optional double dynamic_ff_decay_coff = 12;    // 动力学前馈衰减系数
+    optional double gr_dc = 13;                    // Gr_dc
+    optional double dynamic_yawrate_integration = 14; // 动力学横摆角速度积分
+  }
+  
+  optional DynamicControllerDebug dynamic_controller_debug = 20;  // 动力学控制器调试信息
+  
+  // Lead-Lag调试信息
+  message LeadLagDebug {
+    optional double u_k = 1;                       // u_k
+    optional double u_k_1 = 2;                     // u_k_1
+    optional double e_k_1 = 3;                    // e_k_1
+    optional double e_k = 4;                      // e_k
+    optional double n1 = 5;                        // n1
+    optional double n2 = 6;                       // n2
+    optional double d1 = 7;                       // d1
+    optional double d2 = 8;                       // d2
+  }
+  
+  optional LeadLagDebug lead_lag_debug = 21;       // Lead-Lag调试信息
+}

@@ -1,0 +1,466 @@
+# KPI Configuration for Autonomous Driving Analysis
+
+# 基础配置
+base:
+  # 时间戳同步配置 (单位: 秒)
+  sync_tolerance: 0.3  # 300ms内找不到则丢弃
+  base_frequency: 10   # 基准频率10Hz
+  utm_zone: 51         # UTM区域 (上海区域为51)
+  hemisphere: 'N'      # 北半球
+  
+  # 【内存优化】采样间隔配置
+  # 设置后会对读取的消息进行降采样，减少内存占用
+  # 例如: 0.1 表示每 100ms 采样一次（10Hz），适用于长时间 bag
+  # 注意: 设置过大可能影响高频信号的分析精度
+  # sample_interval: null  # null = 不降采样，保持原始频率
+  # sample_interval: 0.1   # 对于 > 1小时的 bag，建议设置为 0.1s
+  
+  # 【内存优化】轻量模式
+  # 启用后只保留 KPI 计算需要的字段，大幅降低内存占用（约 60-80%）
+  # 流式模式下默认启用，普通模式下需手动开启
+  light_mode: true  # true = 启用轻量模式
+  
+# 自车尺寸信息 (单位: 米)
+ego_vehicle:
+  # 以后轴中心为原点
+  front_length: 3.79    # 前悬+轴距 (940+2850)mm
+  rear_length: 0.883    # 到车尾距离
+  left_width: 0.945     # 到左侧距离
+  right_width: 0.945    # 到右侧距离
+  total_length: 4.658   # 车长
+  total_width: 1.890    # 车宽
+  total_height: 1.656   # 车高
+
+# Topic配置
+topics:
+  function_manager: "/function/function_manager"
+  localization: "/localization/localization"
+  chassis: "/vehicle/chassis_domain_report"
+  control_debug: "/control/debug"  # reserved0字段需要proto解析
+  control: "/control/control"  # 控制指令，用于纵向加速度计算
+  obstacle_list_utm: "/perception/fusion/obstacle_list_utm"
+  trajectory: "/planning/trajectory"  # 规划轨迹，用于曲率计算
+
+# Topic 别名映射
+# 用于处理不同 bag 中 topic 名称不一致的情况
+# 格式: "代码中使用的名称": "bag 中实际的名称"
+topic_aliases:
+  # 示例：如果 bag 中的 topic 带有 /viz 前缀
+  # "/function/function_manager": "/viz/function/function_manager"
+  # "/localization/localization": "/viz/localization/localization"
+  # "/vehicle/chassis_domain_report": "/viz/vehicle/chassis_domain_report"
+  # "/control/debug": "/viz/control/debug"
+  # "/control/control": "/viz/control/control"
+  # "/perception/fusion/obstacle_list_utm": "/viz/perception/fusion/obstacle_list_utm"
+  # "/planning/trajectory": "/viz/planning/trajectory"
+
+# 频率配置
+frequencies:
+  high_freq:  # 50Hz topics
+    - "/localization/localization"
+    - "/control/debug"
+    - "/vehicle/chassis_domain_report"
+    - "/control/control"
+  low_freq:   # 10Hz topics
+    - "/function/function_manager"
+    - "/perception/fusion/obstacle_list_utm"
+    - "/planning/trajectory"
+
+# KPI阈值配置
+kpi:
+  # 1. 自动驾驶判定
+  auto_driving:
+    operator_type_value: 2  # operator_type=2为自动驾驶
+  
+  # 2. 接管检测 (首次进入自动后开始计算)
+  takeover:
+    enabled: true
+  
+  # 3. 直道/弯道判定
+  road_type:
+    curvature_threshold: 0.003  # 曲率阈值 (1/m), 小于此值为直道
+  
+  # 4. 转向平滑度（横向猛打阈值，保留用于紧急事件检测）
+  steering:
+    enabled: true
+    # 转角速度阈值 (°/s)，按速度分段（用于横向猛打检测）
+    speed_thresholds:
+      0: 200    # 0-10 km/h
+      10: 180   # 10-20 km/h
+      20: 160   # 20-30 km/h
+      30: 140   # 30-40 km/h
+      40: 120   # 40-50 km/h
+      50: 100   # 50-60 km/h
+      60: 80    # 60-70 km/h
+      70: 60    # 70+ km/h
+    # 转角加速度阈值 (°/s²)，按速度分段（用于横向猛打检测）
+    steering_acc_thresholds:
+      100: 120   # >100 km/h
+      80: 150    # >80 km/h
+      60: 200    # >60 km/h
+      30: 250    # >30 km/h
+      10: 400    # >10 km/h
+      0: 600     # ≤10 km/h (低速最大允许)
+  
+  # 4.1. 转向平滑度 KPI（新标准）
+  steering_smoothness:
+    enabled: true
+    description: >
+      Steering smoothness KPI based on steering angle and steering angle rate.
+      Used to evaluate whether steering control is smooth and stable,
+      without detecting specific abnormal events (e.g. weaving).
+
+    ########################################
+    # 1. 基本参数
+    ########################################
+    sampling_rate_hz: 50
+
+    valid_condition:
+      min_speed_kmh: 1.0
+
+    ########################################
+    # 2. 信号预处理
+    ########################################
+    preprocessing:
+      steering_angle:
+        signal: steering_angle_deg
+        lowpass_filter:
+          type: butterworth
+          order: 2
+          cutoff_hz: 3.0   # 抑制 EPS 齿隙与量化噪声
+
+      steering_angle_rate:
+        signal: steering_angle_rate_deg_s
+        lowpass_filter:
+          type: butterworth
+          order: 2
+          cutoff_hz: 5.0   # 保留真实转向动态
+
+    ########################################
+    # 3. 滑动窗口配置
+    ########################################
+    window:
+      duration_sec: 1.0   # 1 秒窗口
+      step_sec: 0.1       # 100 ms 更新一次
+
+    ########################################
+    # 4. KPI 指标定义
+    ########################################
+    metrics:
+
+      # 4.1 转角速度 RMS（核心平滑度指标）
+      steering_rate_rms:
+        enabled: true
+        description: >
+          RMS of steering angle rate within sliding window.
+          Reflects overall steering aggressiveness and smoothness.
+        unit: deg/s
+
+      # 4.2 转角速度 P95（极端操作检测）
+      steering_rate_p95:
+        enabled: true
+        description: >
+          95th percentile of absolute steering angle rate.
+          Used to capture occasional aggressive steering behavior.
+        unit: deg/s
+
+      # 4.3 转角速度符号翻转率（稳定性）
+      steering_rate_flip:
+        enabled: true
+        description: >
+          Rate of steering angle rate sign changes above a minimum threshold,
+          indicating frequent steering corrections.
+        unit: times_per_sec
+        min_effective_rate_deg_s: 5.0
+
+    ########################################
+    # 5. 速度区间划分（细化版）
+    ########################################
+    speed_bins_kmh:
+      - [0, 10]
+      - [10, 20]
+      - [20, 30]
+      - [30, 40]
+      - [40, 50]
+      - [50, 60]
+      - [60, 80]
+      - [80, 120]
+
+    ########################################
+    # 6. 各速度区间 KPI 参考阈值
+    ########################################
+    thresholds:
+
+      steering_rate_rms:
+        - speed_range: [0, 10]
+          warn: 60
+          fail: 80
+
+        - speed_range: [10, 20]
+          warn: 50
+          fail: 70
+
+        - speed_range: [20, 30]
+          warn: 40
+          fail: 60
+
+        - speed_range: [30, 40]
+          warn: 35
+          fail: 55
+
+        - speed_range: [40, 50]
+          warn: 30
+          fail: 45
+
+        - speed_range: [50, 60]
+          warn: 25
+          fail: 40
+
+        - speed_range: [60, 80]
+          warn: 20
+          fail: 35
+
+        - speed_range: [80, 120]
+          warn: 18
+          fail: 30
+
+      steering_rate_p95:
+        - speed_range: [0, 10]
+          warn: 90
+          fail: 120
+
+        - speed_range: [10, 20]
+          warn: 80
+          fail: 110
+
+        - speed_range: [20, 30]
+          warn: 70
+          fail: 100
+
+        - speed_range: [30, 40]
+          warn: 60
+          fail: 90
+
+        - speed_range: [40, 50]
+          warn: 55
+          fail: 80
+
+        - speed_range: [50, 60]
+          warn: 50
+          fail: 75
+
+        - speed_range: [60, 80]
+          warn: 45
+          fail: 70
+
+        - speed_range: [80, 120]
+          warn: 40
+          fail: 65
+
+      steering_rate_flip:
+        - speed_range: [0, 10]
+          warn: 3.0
+          fail: 4.0
+
+        - speed_range: [10, 20]
+          warn: 2.5
+          fail: 3.5
+
+        - speed_range: [20, 30]
+          warn: 2.0
+          fail: 3.0
+
+        - speed_range: [30, 40]
+          warn: 1.8
+          fail: 2.5
+
+        - speed_range: [40, 50]
+          warn: 1.5
+          fail: 2.2
+
+        - speed_range: [50, 60]
+          warn: 1.2
+          fail: 2.0
+
+        - speed_range: [60, 80]
+          warn: 1.0
+          fail: 1.8
+
+        - speed_range: [80, 120]
+          warn: 0.8
+          fail: 1.5
+
+    ########################################
+    # 7. 输出与统计
+    ########################################
+    output:
+      per_window: false
+      aggregate:
+        - mean
+        - max
+        - p95
+      group_by_speed_bin: true
+  
+  ##################################################
+  # 5. 舒适性 / 动力学 KPI (L4_dynamics_v1.0)
+  #    速度相关阈值，适用于 50Hz 数据
+  ##################################################
+  comfort:
+    enabled: true
+    
+    # Jerk 计算参数（底盘信号 50Hz 推荐配置）
+    target_fs: null        # 目标采样频率 (Hz)，null = 使用原始采样率 (50Hz)
+    filter_method: butter  # 滤波方法：'butter' (Butterworth), 'savgol', 'none'
+    cutoff_hz: 10.0        # 低通截止频率 (Hz)，50Hz底盘推荐 10-15Hz
+    
+    # 动力学参数
+    sampling_rate_hz: 50
+    rms_window_sec: 1.0           # RMS 统计窗口（1s = 50 点）
+    min_valid_speed_kph: 5.0      # 低于该速度不统计 jerk，避免噪声放大
+    
+    # 事件定义
+    event_definition:
+      min_event_gap_sec: 2.0      # 两次事件最小间隔
+      merge_close_events: true
+    
+    # --- 纵向加速度阈值 (m/s²) ---
+    longitudinal_acceleration:
+      unit: "m/s^2"
+      ranges:
+        - speed_kph: [0, 10]
+          comfort: 2.5
+          warn: 3.5
+          fail: 3.5
+        - speed_kph: [10, 30]
+          comfort: 2.0
+          warn: 3.0
+          fail: 3.0
+        - speed_kph: [30, 60]
+          comfort: 1.6
+          warn: 2.5
+          fail: 2.5
+        - speed_kph: [60, 999]
+          comfort: 1.2
+          warn: 2.0
+          fail: 2.0
+    
+    # --- 纵向减速度阈值 (m/s²) ---
+    longitudinal_deceleration:
+      unit: "m/s^2"
+      ranges:
+        - speed_kph: [0, 10]
+          comfort: 3.0
+          warn: 4.0
+          fail: 4.0
+        - speed_kph: [10, 30]
+          comfort: 2.5
+          warn: 3.5
+          fail: 3.5
+        - speed_kph: [30, 60]
+          comfort: 2.0
+          warn: 3.0
+          fail: 3.0
+        - speed_kph: [60, 999]
+          comfort: 1.5
+          warn: 2.5
+          fail: 2.5
+    
+    # --- 纵向 Jerk 阈值 (m/s³) - 核心平顺性指标 ---
+    longitudinal_jerk:
+      unit: "m/s^3"
+      rms:
+        ranges:
+          - speed_kph: [0, 10]
+            threshold: 1.5
+          - speed_kph: [10, 30]
+            threshold: 1.2
+          - speed_kph: [30, 60]
+            threshold: 1.0
+          - speed_kph: [60, 999]
+            threshold: 0.8
+      peak:
+        ranges:
+          - speed_kph: [0, 10]
+            threshold: 3.0
+          - speed_kph: [10, 30]
+            threshold: 2.5
+          - speed_kph: [30, 60]
+            threshold: 2.0
+          - speed_kph: [60, 999]
+            threshold: 1.5
+      fail_condition:
+        rms_duration_sec: 1.0       # RMS 超阈持续时间
+        peak_count_per_min: 3       # 峰值频繁出现判 Fail
+  
+  # 6. 急减速检测
+  hard_braking:
+    acceleration_threshold: -3.0  # m/s²
+    min_duration: 0.1  # 100ms持续
+    reset_duration: 0.2  # 200ms后重置
+  
+  # 7. 顿挫检测
+  jerk_event:
+    jerk_threshold: 2.5  # m/s³
+    min_duration: 0.2  # 200ms
+  
+  # 9. 画龙检测
+  weaving:
+    lateral_error_threshold: 0.30  # 30cm
+  
+  # 10. ROI障碍物检测 - 三级区域设计
+  roi:
+    # 近距离：圆形区域（紧急反应区）
+    near_radius: 10.0  # 半径 10m
+    
+    # 中距离：矩形区域（主动避障区）
+    # 左右宽度：核心 3.5m + 缓冲 1.5m = 5.0m
+    mid_roi:
+      front: 25.0  # 刹车距离 + 反应距离
+      rear: 10.0   # 被追尾预警
+      left: 5.0    # 核心 3.5m + 缓冲 1.5m
+      right: 5.0
+    
+    # 远距离：矩形区域（预警感知区）
+    # 左右宽度：6.5~7.0m，取 7.0m
+    far_roi:
+      front: 60.0  # 高速预警
+      rear: 25.0   # 快速接近车辆
+      left: 7.0    # 相邻车道 + 大型车辆
+      right: 7.0
+    
+    # 可视化配置
+    visualization:
+      enabled: true
+      sample_count: 30  # 随机抽样画图数量
+      output_dir: "output/roi_viz"
+  
+  # 11. 道路曲率
+  curvature:
+    enabled: true
+    max_distance_threshold: 3.0  # 最大匹配距离阈值(m)，超过此距离的匹配点将被忽略
+    map_viz:
+      enabled: true
+      output_dir: "output/map_viz"
+      mapbox_token: "pk.eyJ1IjoiaGVkYW5lciIsImEiOiJjbTBra2MxMGYxN2NkMnNvYnJjbW96dDJiIn0.10SX40LwAjsRupK2FURZYQ"  # 请替换为您的 Mapbox token
+  
+  # 12. 定位置信度
+  localization:
+    status_normal: 3
+    status_waiting: 2
+    high_stddev_threshold: 1.0  # 1.0m
+    medium_stddev_threshold: 0.2
+
+# 障碍物类型映射
+obstacle_types:
+  0: "未知"
+  30: "人"
+  60: "车"
+  90: "自行车"
+  120: "动物"
+  150: "静态障碍物"
+  180: "交通锥"
+
+# 障碍物运动状态
+obstacle_motion:
+  static: 3
+  moving: 1
