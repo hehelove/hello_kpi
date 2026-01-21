@@ -9,6 +9,10 @@ dist/
 build/
 eggs/
 *.egg
+compile_proto.py
+scripts/
+docs/
+tests/
 
 # Virtual environments
 venv/
