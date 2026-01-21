@@ -135,6 +135,7 @@ class KPIAnalyzer:
             max_workers: 并行计算 KPI 的最大线程数
             use_cache: 是否启用持久化缓存（缓存 synced_frames）
             cache_dir: 缓存目录
+            only_kpi: 只运行指定的 KPI（如 "画龙检测"）
         """
         # 加载配置
         if config_path is None:
@@ -145,6 +146,8 @@ class KPIAnalyzer:
         self.progress_callback = progress_callback or self._default_progress
         self.use_cache = use_cache
         self.frame_cache = FrameStoreCache(cache_dir) if use_cache else None
+        self.only_kpi = None  # 单 KPI 模式
+        self.disable_planning_debug = True  # 默认禁用 planning debug 处理（目前未使用）
         
         # 初始化组件（延迟初始化）
         self.bag_reader = None
@@ -185,9 +188,14 @@ class KPIAnalyzer:
             logger.warning(f"配置文件未找到: {config_path}")
             return {}
     
-    def _init_kpi_calculators(self):
-        """初始化KPI计算器"""
-        self.kpi_calculators = [
+    def _init_kpi_calculators(self, only_kpi: str = None):
+        """
+        初始化KPI计算器
+        
+        Args:
+            only_kpi: 只运行指定的 KPI（名称匹配，如 "画龙检测"）
+        """
+        all_kpis = [
             MileageKPI(self.config),
             TakeoverKPI(self.config),
             LaneKeepingKPI(self.config),
@@ -200,35 +208,105 @@ class KPIAnalyzer:
             CurvatureKPI(self.config),
             SpeedingKPI(self.config)
         ]
+        
+        if only_kpi:
+            # 过滤指定的 KPI，同时保留其依赖
+            target_kpi = None
+            for kpi in all_kpis:
+                if only_kpi in kpi.name or kpi.name in only_kpi:
+                    target_kpi = kpi
+                    break
+            
+            if target_kpi is None:
+                available = [k.name for k in all_kpis]
+                raise ValueError(f"未找到 KPI: {only_kpi}\n可用的 KPI: {available}")
+            
+            # 收集依赖的 KPI
+            kpi_map = {k.name: k for k in all_kpis}
+            required = {target_kpi.name}
+            queue = list(target_kpi.dependencies)
+            while queue:
+                dep = queue.pop(0)
+                if dep in kpi_map and dep not in required:
+                    required.add(dep)
+                    queue.extend(kpi_map[dep].dependencies)
+            
+            self.kpi_calculators = [k for k in all_kpis if k.name in required]
+            print(f"[单KPI模式] 运行: {target_kpi.name}")
+            if len(self.kpi_calculators) > 1:
+                deps = [k.name for k in self.kpi_calculators if k.name != target_kpi.name]
+                print(f"[单KPI模式] 依赖: {deps}")
+        else:
+            self.kpi_calculators = all_kpis
     
     def _get_required_topics(self) -> List[str]:
         """获取所有需要的topic"""
         topics = set()
         for kpi in self.kpi_calculators:
             topics.update(kpi.required_topics)
+        # 添加用于高频数据收集的额外 topics（不属于任何 KPI 的 required_topics）
+        if not self.disable_planning_debug:
+            topics.add(Topics.PLANNING_DEBUG)  # planning debug 数据
+        topics.add(Topics.MAP)  # 地图数据（用于场景检测）
+        topics.add(Topics.PLANNING_TRAJECTORY)  # trajectory 数据（用于场景检测）
         return list(topics)
     
     def _sort_kpis_by_dependency(self) -> tuple:
         """
-        按依赖关系对 KPI 进行分组
+        使用拓扑排序按依赖关系对 KPI 进行排序
         
         Returns:
             (independent_kpis, dependent_kpis_ordered)
             - independent_kpis: 无依赖的 KPI（可并行计算）
-            - dependent_kpis_ordered: 有依赖的 KPI（按依赖顺序）
+            - dependent_kpis_ordered: 有依赖的 KPI（按拓扑排序顺序）
         """
+        from collections import deque
+        
+        # 构建 KPI 名称到实例的映射
+        kpi_map = {kpi.name: kpi for kpi in self.kpi_calculators}
+        
+        # 构建依赖图和入度
+        in_degree = {kpi.name: 0 for kpi in self.kpi_calculators}
+        graph = {kpi.name: [] for kpi in self.kpi_calculators}  # 被谁依赖
+        
+        for kpi in self.kpi_calculators:
+            for dep in kpi.dependencies:
+                if dep in kpi_map:
+                    graph[dep].append(kpi.name)
+                    in_degree[kpi.name] += 1
+        
+        # 分离独立 KPI
         independent = []
-        dependent = []
+        dependent_names = []
         
         for kpi in self.kpi_calculators:
             if not kpi.dependencies:
                 independent.append(kpi)
-            else:
-                dependent.append(kpi)
         
-        # 对有依赖的 KPI 按依赖排序（简单实现：里程统计优先）
-        # 更复杂的场景可以使用拓扑排序
-        dependent.sort(key=lambda k: 0 if KPINames.MILEAGE in k.dependencies else 1)
+        # Kahn's algorithm 拓扑排序
+        queue = deque([name for name, deg in in_degree.items() if deg == 0])
+        sorted_order = []
+        
+        while queue:
+            current = queue.popleft()
+            sorted_order.append(current)
+            
+            for neighbor in graph[current]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        
+        # 检查是否有循环依赖
+        if len(sorted_order) != len(self.kpi_calculators):
+            unsorted = [name for name in in_degree if in_degree[name] > 0]
+            logger.warning(f"KPI 依赖存在循环: {unsorted}")
+        
+        # 分离有依赖的 KPI（按拓扑排序顺序）
+        independent_names = {kpi.name for kpi in independent}
+        dependent = [
+            kpi_map[name] for name in sorted_order 
+            if name not in independent_names and name in kpi_map
+        ]
         
         return independent, dependent
     
@@ -239,7 +317,7 @@ class KPIAnalyzer:
         步骤1: 初始化组件
         """
         self.progress_callback(1, 6, "初始化...")
-        self._init_kpi_calculators()
+        self._init_kpi_calculators(self.only_kpi)
         
         bag_path_obj = Path(bag_path)
         is_multi_bag = False
@@ -466,6 +544,7 @@ class KPIAnalyzer:
         }
         
         auto_mileage_km = 0.0
+        auto_time_s = 0.0  # 自动驾驶时间（秒）
         
         # === 第一阶段：计算无依赖的 KPI ===
         total_kpis = len(independent_kpis) + len(dependent_kpis)
@@ -483,12 +562,18 @@ class KPIAnalyzer:
                 success_count += 1
                 print(f"  [{computed}/{total_kpis}] ✓ {kpi.name} ({result.duration_ms:.0f}ms)")
                 
-                # 提取里程统计结果
+                # 提取里程统计结果（用于传递给依赖的 KPI）
                 if kpi.name == KPINames.MILEAGE:
                     for r in result.results:
                         if r.name == "自动驾驶里程":
                             auto_mileage_km = r.value
-                            break
+                        elif r.name == "自动驾驶时间":
+                            # 从 details 中提取精确秒数
+                            if r.details and 'time_s' in r.details:
+                                auto_time_s = r.details['time_s']
+                            else:
+                                # 备选：从分钟值转换（有精度损失）
+                                auto_time_s = r.value * 60
             else:
                 failed_kpis.append(kpi.name)
                 print(f"  [{computed}/{total_kpis}] ✗ {kpi.name}: {result.error}")
@@ -500,6 +585,7 @@ class KPIAnalyzer:
             # 添加依赖参数
             dep_kwargs = base_kwargs.copy()
             dep_kwargs['auto_mileage_km'] = auto_mileage_km
+            dep_kwargs['auto_time_s'] = auto_time_s  # 自动驾驶时间（与里程统计一致）
             
             result = self._compute_single_kpi(kpi, dep_kwargs)
             self._kpi_results[kpi.name] = result
@@ -688,6 +774,311 @@ class KPIAnalyzer:
         synchronizer.add_topic_data(topic_data)
         return synchronizer.synchronize(use_global_timestamp=True)
     
+    def _enrich_anomalies_with_scene(self, results: List[Dict], streaming_data: StreamingData):
+        """
+        为所有 anomaly 添加场景信息
+        
+        根据 anomaly 的时间戳：
+        1. 从 trajectory_lane_ids 中找到对应的 lane_id
+        2. 从 map_lanes_data 中找到对应时刻的 map 数据
+        3. 在该时刻的 map 中查找 lane 属性判断场景
+        
+        Args:
+            results: KPI 结果列表，每个结果可能包含 anomalies
+            streaming_data: 流式数据容器，包含 map_lanes_data 和 trajectory_lane_ids
+        """
+        from src.scene import JunctionSceneDetector
+        import numpy as np
+        
+        if not streaming_data.map_lanes_data:
+            return  # 没有地图数据，无法检测场景
+        
+        if not streaming_data.trajectory_lane_ids:
+            return  # 没有 trajectory 数据，无法检测场景
+        
+        # 初始化场景检测器（使用时间序列模式）
+        detector = JunctionSceneDetector()
+        num_frames = detector.load_map_timeseries(streaming_data.map_lanes_data)
+        
+        stats = detector.get_scene_stats()
+        print(f"  [场景检测] 已加载 {num_frames} 帧地图数据，"
+              f"包含 {stats['total_lanes']} 条 lane（路口: {stats['junction_lanes']}, 非路口: {stats['non_junction_lanes']}）")
+        
+        # 构建 trajectory_lane_ids 的时间索引
+        traj_timestamps = np.array([t[1] for t in streaming_data.trajectory_lane_ids])
+        traj_lane_ids = [t[0] for t in streaming_data.trajectory_lane_ids]
+        
+        scene_count = 0
+        
+        # 遍历所有结果的 anomaly
+        for result in results:
+            if 'anomalies' not in result:
+                continue
+            
+            for anomaly in result['anomalies']:
+                ts = anomaly.get('timestamp')
+                if ts is None:
+                    continue
+                
+                # 找到最近的 trajectory 时间戳获取 lane_ids
+                idx = np.searchsorted(traj_timestamps, ts)
+                if idx == 0:
+                    lane_ids = traj_lane_ids[0]
+                elif idx >= len(traj_timestamps):
+                    lane_ids = traj_lane_ids[-1]
+                else:
+                    # 选择更近的那个
+                    if ts - traj_timestamps[idx-1] < traj_timestamps[idx] - ts:
+                        lane_ids = traj_lane_ids[idx-1]
+                    else:
+                        lane_ids = traj_lane_ids[idx]
+                
+                # 使用时间戳和 lane_ids 检测场景
+                scene_info = detector.detect_at_time(ts, lane_ids)
+                anomaly['scene'] = scene_info.to_dict()
+                scene_count += 1
+        
+        print(f"  [场景检测] 已为 {scene_count} 个异常事件添加场景标注")
+    
+    def _compute_junction_pass_rate(self, results: List[Dict], streaming_data: StreamingData) -> Dict:
+        """
+        计算路口通过率
+        
+        路口内发生以下情况视为"不通过"：
+        - 接管
+        - 急刹/急减速
+        - 顿挫
+        
+        按转向类型（直行、左转、右转、掉头）分别统计
+        
+        Args:
+            results: KPI 结果列表
+            streaming_data: 包含 map_lanes_data 和 trajectory_lane_ids
+            
+        Returns:
+            路口通过率统计结果
+        """
+        from src.scene import JunctionSceneDetector
+        
+        if not streaming_data.map_lanes_data or not streaming_data.trajectory_lane_ids:
+            print(f"  [路口统计] 缺少地图或轨迹数据，跳过统计")
+            return {}
+        
+        # 初始化场景检测器
+        detector = JunctionSceneDetector()
+        detector.load_map_timeseries(streaming_data.map_lanes_data)
+        
+        # 提取所有路口区间
+        intervals = detector.extract_junction_intervals(streaming_data.trajectory_lane_ids)
+        
+        if not intervals:
+            print(f"  [路口统计] 未检测到路口通行记录")
+            return {}
+        
+        print(f"  [路口统计] 检测到 {len(intervals)} 次路口通行")
+        
+        # 收集所有异常记录
+        all_anomalies = []
+        for result in results:
+            if 'anomalies' not in result:
+                continue
+            for anomaly in result['anomalies']:
+                all_anomalies.append(anomaly)
+        
+        # 计算通过率（默认失败类型：接管、急刹、急减速、顿挫）
+        pass_rate_result = detector.compute_junction_pass_rate(
+            intervals, 
+            all_anomalies,
+            failure_types=['接管', '急刹', '急减速', '顿挫']
+        )
+        
+        # 打印统计结果
+        summary = pass_rate_result.get('summary', {})
+        by_turn = pass_rate_result.get('by_turn', {})
+        
+        print(f"  [路口统计] 总体通过率: {summary.get('pass_rate', 0):.1f}% "
+              f"({summary.get('passed', 0)}/{summary.get('total_junctions', 0)})")
+        
+        for turn_name, stats in by_turn.items():
+            print(f"    - {turn_name}: {stats['pass_rate']:.1f}% ({stats['passed']}/{stats['total']})")
+        
+        if summary.get('failed', 0) > 0:
+            print(f"  [路口统计] 失败次数: {summary.get('failed', 0)}")
+        
+        return pass_rate_result
+    
+    def _collect_highfreq_data(self, topic_data: Dict, streaming_data: StreamingData):
+        """
+        从原始 topic 数据中收集高频数据（不经过同步下采样）
+        
+        高频数据用于需要精确信号分析的 KPI：
+        - 底盘数据 (理论 ~50Hz，实际可能更低): 转向平滑度、画龙检测、横向猛打
+        - 控制数据 (理论 ~50Hz，实际可能更低): 舒适性(jerk)、急减速
+        
+        Note:
+            实际采样率可能因系统负载、网络延迟等因素低于理论值。
+            各 KPI 的 compute_from_collected 方法会动态估计实际采样率。
+        
+        Args:
+            topic_data: 原始 topic 数据字典
+            streaming_data: 流式数据容器
+        """
+        from src.data_loader.bag_reader import MessageAccessor
+        import numpy as np
+        
+        auto_operator_type = self.config.get('kpi', {}).get(
+            'auto_driving', {}).get('operator_type_value', 2)
+        
+        # 1. 获取 func 的自动驾驶状态时间序列（用于插值）
+        func_topic = Topics.FUNCTION_MANAGER
+        func_timestamps = []
+        func_auto_states = []
+        
+        if func_topic in topic_data:
+            func_data = topic_data[func_topic]
+            for msg, ts in zip(func_data.messages, func_data.timestamps):
+                operator_type = MessageAccessor.get_field(msg, "operator_type")
+                if operator_type is not None:
+                    func_timestamps.append(ts)
+                    func_auto_states.append(operator_type == auto_operator_type)
+        
+        func_timestamps = np.array(func_timestamps) if func_timestamps else np.array([])
+        func_auto_states = np.array(func_auto_states) if func_auto_states else np.array([])
+        
+        # 2. 收集底盘高频数据 (~50Hz)
+        chassis_topic = "/vehicle/chassis_domain_report"
+        if chassis_topic in topic_data:
+            chassis_data = topic_data[chassis_topic]
+            for msg, ts in zip(chassis_data.messages, chassis_data.timestamps):
+                steering_angle = MessageAccessor.get_field(
+                    msg, "eps_system.actual_steering_angle", None)
+                steering_vel = MessageAccessor.get_field(
+                    msg, "eps_system.actual_steering_angle_velocity", None)
+                speed = MessageAccessor.get_field(
+                    msg, "motion_system.vehicle_speed", None)
+                lat_acc = MessageAccessor.get_field(
+                    msg, "motion_system.vehicle_lateral_acceleration", None)
+                
+                if steering_angle is None or speed is None:
+                    continue
+                
+                # 存储: (steering_angle, steering_vel, speed, lat_acc, timestamp)
+                streaming_data.chassis_highfreq.append((
+                    steering_angle,
+                    steering_vel if steering_vel is not None else 0.0,
+                    speed,
+                    lat_acc if lat_acc is not None else 0.0,
+                    ts
+                ))
+                
+                # 插值获取该时刻的自动驾驶状态
+                if len(func_timestamps) > 0:
+                    # 找到最近的 func 时间戳
+                    idx = np.searchsorted(func_timestamps, ts)
+                    if idx == 0:
+                        is_auto = func_auto_states[0]
+                    elif idx >= len(func_timestamps):
+                        is_auto = func_auto_states[-1]
+                    else:
+                        # 选择更近的那个
+                        if ts - func_timestamps[idx-1] < func_timestamps[idx] - ts:
+                            is_auto = func_auto_states[idx-1]
+                        else:
+                            is_auto = func_auto_states[idx]
+                    streaming_data.chassis_auto_states.append((bool(is_auto), ts))
+                else:
+                    streaming_data.chassis_auto_states.append((False, ts))
+        
+        # 3. 收集控制高频数据 (~100Hz)
+        control_topic = Topics.CONTROL
+        if control_topic in topic_data:
+            control_data = topic_data[control_topic]
+            for msg, ts in zip(control_data.messages, control_data.timestamps):
+                lon_acc = MessageAccessor.get_field(
+                    msg, "chassis_control.target_longitudinal_acceleration", None)
+                
+                if lon_acc is None:
+                    continue
+                
+                # 存储: (lon_acc, timestamp)
+                streaming_data.control_highfreq.append((lon_acc, ts))
+                
+                # 插值获取该时刻的自动驾驶状态
+                if len(func_timestamps) > 0:
+                    idx = np.searchsorted(func_timestamps, ts)
+                    if idx == 0:
+                        is_auto = func_auto_states[0]
+                    elif idx >= len(func_timestamps):
+                        is_auto = func_auto_states[-1]
+                    else:
+                        if ts - func_timestamps[idx-1] < func_timestamps[idx] - ts:
+                            is_auto = func_auto_states[idx-1]
+                        else:
+                            is_auto = func_auto_states[idx]
+                    streaming_data.control_auto_states.append((bool(is_auto), ts))
+                else:
+                    streaming_data.control_auto_states.append((False, ts))
+        
+        # 4. 收集 Planning 调试数据 (~10Hz 或更低)
+        if not self.disable_planning_debug:
+            planning_debug_topic = Topics.PLANNING_DEBUG
+            if planning_debug_topic in topic_data:
+                # 导入 planning debug parser
+                try:
+                    from src.proto.planning_debug_parser import PlanningDebugParser
+                    parser = PlanningDebugParser()
+                    if parser.is_available:
+                        planning_data = topic_data[planning_debug_topic]
+                        for msg, ts in zip(planning_data.messages, planning_data.timestamps):
+                            parsed = parser.parse_planning_debug(msg, external_timestamp=ts)
+                            if parsed and parsed.central_decider_debug:
+                                # 存储: (present_status, trajectory_type, is_replan, timestamp)
+                                streaming_data.planning_debug_data.append((
+                                    parsed.central_decider_debug.present_status,
+                                    parsed.trajectory_type,
+                                    parsed.is_replan,
+                                    ts
+                                ))
+                except ImportError:
+                    pass  # proto 不可用，跳过
+        
+        # 5. 收集 /map/map 的 lanes 数据（按时间戳存储，用于场景检测）
+        # /map/map 是局部地图，会随车辆位置更新，需要按时间戳存储
+        map_topic = Topics.MAP
+        if map_topic in topic_data:
+            map_data = topic_data[map_topic]
+            
+            for msg, ts in zip(map_data.messages, map_data.timestamps):
+                if hasattr(msg, 'lanes'):
+                    # 提取该时刻的所有 lanes 信息
+                    lanes_at_time = {}
+                    for lane in msg.lanes:
+                        lane_id = str(lane.id)
+                        # 兼容轻量级消息 (lane_type) 和原始消息 (type)
+                        lane_type = getattr(lane, 'lane_type', None)
+                        if lane_type is None:
+                            lane_type = getattr(lane, 'type', 0)
+                        
+                        lanes_at_time[lane_id] = {
+                            'lane_id': lane_id,
+                            'turn': getattr(lane, 'turn', 1),
+                            'junction_id': getattr(lane, 'junction_id', None) or None,
+                            'type': lane_type
+                        }
+                    
+                    # 存储: (timestamp, lanes_dict)
+                    streaming_data.map_lanes_data.append((ts, lanes_at_time))
+        
+        # 6. 收集 /planning/trajectory 的 lane_id 序列（用于场景检测）
+        trajectory_topic = Topics.PLANNING_TRAJECTORY
+        if trajectory_topic in topic_data:
+            traj_data = topic_data[trajectory_topic]
+            for msg, ts in zip(traj_data.messages, traj_data.timestamps):
+                lane_ids = getattr(msg, 'lane_id', None)
+                if lane_ids is not None:
+                    # 存储: (lane_ids: List[str], timestamp)
+                    streaming_data.trajectory_lane_ids.append((list(lane_ids), ts))
+    
     def _compute_kpis_for_bag(self, synced_frames: List, bag_info: Any,
                               parsed_debug_data: Dict) -> Dict[str, List[KPIResult]]:
         """
@@ -755,8 +1146,88 @@ class KPIAnalyzer:
         
         return results
     
+    def _process_single_bag_streaming(self, topic_data: Dict, item_name: str,
+                                       item_idx: int, total_items: int,
+                                       streaming_data, streaming_kpis: List,
+                                       global_parsed_debug_data: Dict,
+                                       disk_store) -> None:
+        """
+        处理单个 bag 的数据（流式模式内部使用）
+        
+        将读取到的 topic_data 进行：
+        1. 解析控制调试数据
+        2. 收集高频数据
+        3. 时间同步
+        4. 写入缓存
+        5. 调用 KPI collect
+        
+        处理后的同步帧数保存在 self._last_synced_frame_count
+        """
+        # 解析控制调试数据
+        debug_topic = Topics.CONTROL_DEBUG
+        if debug_topic in topic_data:
+            if self.control_parser is None:
+                self.control_parser = ControlDebugParser()
+            topic = topic_data[debug_topic]
+            parsed = self.control_parser.batch_parse(topic.messages, topic.timestamps)
+            global_parsed_debug_data.update(parsed)
+        
+        # 记录高频数据和 planning debug 数据起始位置（用于缓存写入）
+        chassis_start_idx = len(streaming_data.chassis_highfreq)
+        control_start_idx = len(streaming_data.control_highfreq)
+        planning_debug_start_idx = len(streaming_data.planning_debug_data)
+        
+        # 收集高频原始数据（在同步之前，保留完整频率）
+        self._collect_highfreq_data(topic_data, streaming_data)
+        
+        # 时间同步（10Hz，用于低频 KPI）
+        synced_frames = self._synchronize_single_bag_data(topic_data)
+        
+        # 计算本次新增的高频数据量
+        chassis_new_count = len(streaming_data.chassis_highfreq) - chassis_start_idx
+        control_new_count = len(streaming_data.control_highfreq) - control_start_idx
+        planning_debug_new_count = len(streaming_data.planning_debug_data) - planning_debug_start_idx
+        print(f"      同步帧数: {len(synced_frames)}, 高频: chassis=+{chassis_new_count:,}, control=+{control_new_count:,}, planning_debug=+{planning_debug_new_count:,}")
+        
+        self._last_synced_frame_count = len(synced_frames)
+        
+        # 写入缓存（如果启用）
+        if disk_store is not None:
+            if synced_frames:
+                disk_store.append_batch(synced_frames, item_name)
+            # 写入本次新增的高频数据
+            if chassis_new_count > 0:
+                disk_store.append_chassis_highfreq(
+                    streaming_data.chassis_highfreq[chassis_start_idx:],
+                    streaming_data.chassis_auto_states[chassis_start_idx:],
+                    item_name
+                )
+            if control_new_count > 0:
+                disk_store.append_control_highfreq(
+                    streaming_data.control_highfreq[control_start_idx:],
+                    streaming_data.control_auto_states[control_start_idx:],
+                    item_name
+                )
+            # 写入 planning debug 数据
+            if planning_debug_new_count > 0:
+                disk_store.append_planning_debug(
+                    streaming_data.planning_debug_data[planning_debug_start_idx:],
+                    item_name
+                )
+        
+        # 直接调用所有 KPI 的 collect（核心优化点！）
+        for kpi in streaming_kpis:
+            try:
+                kpi.collect(synced_frames, streaming_data,
+                           parsed_debug_data=global_parsed_debug_data)
+            except Exception:
+                pass
+        
+        # 清理同步帧（内存优化）
+        synced_frames.clear()
+    
     def analyze_true_streaming(self, bag_path: str, output_dir: str = "./output", 
-                                use_cache: bool = True) -> Dict:
+                                use_cache: bool = True, parallel_bags: int = 1) -> Dict:
         """
         真正的流式处理模式（内存最优 + 缓存支持）
         
@@ -765,11 +1236,13 @@ class KPIAnalyzer:
         2. 支持磁盘缓存：首次处理写入缓存，后续直接加载
         3. 内存峰值只是单个 bag 的大小
         4. 适合处理超大数据集
+        5. 支持并行读取多个 bag（parallel_bags > 1 时启用）
         
         Args:
             bag_path: ROS2 bag路径或包含多个bag的目录
             output_dir: 输出目录
             use_cache: 是否使用缓存（默认 True）
+            parallel_bags: 并行读取的 bag 数量（默认 1，建议设置为 CPU 核数/4）
             
         Returns:
             分析结果字典
@@ -794,7 +1267,7 @@ class KPIAnalyzer:
         total_start = time.perf_counter()
         
         # 初始化 KPI 计算器
-        self._init_kpi_calculators()
+        self._init_kpi_calculators(self.only_kpi)
         
         # 检测 bag 结构
         bag_path_obj = Path(bag_path)
@@ -823,8 +1296,24 @@ class KPIAnalyzer:
         else:
             print(f"  - 模式: 单Bag")
         
-        # 检查缓存
-        cache = FrameStoreCache(cache_dir=".frame_cache") if use_cache else None
+        # 数据质量检查器
+        from src.utils.data_quality import (
+            DataQualityChecker, ConfigValidator, DataQualityReport
+        )
+        quality_checker = DataQualityChecker(self.config)
+        
+        # 配置校验
+        config_validator = ConfigValidator(self.config)
+        config_warnings = config_validator.validate()
+        if config_warnings:
+            print(f"\n[⚠️ 配置警告]")
+            for w in config_warnings[:3]:  # 只显示前3条
+                print(f"    - {w}")
+            if len(config_warnings) > 3:
+                print(f"    ... 共 {len(config_warnings)} 条警告")
+        
+        # 检查缓存（传入配置用于指纹验证）
+        cache = FrameStoreCache(cache_dir=".frame_cache", config=self.config) if use_cache else None
         cached_store = cache.load(bag_path) if cache else None
         
         if cached_store:
@@ -850,6 +1339,21 @@ class KPIAnalyzer:
         bag_info_dict = self.bag_reader.get_topic_info()
         available_topics = set(bag_info_dict.keys())
         topics_to_read = [t for t in required_topics if t in available_topics]
+        
+        # Topic 完整性检查
+        missing_topics, matched_topics = quality_checker.check_topic_completeness(
+            required_topics, list(available_topics)
+        )
+        if missing_topics:
+            print(f"\n[⚠️ 缺失 Topic] ({len(missing_topics)} 个)")
+            for t in missing_topics[:5]:
+                print(f"    - {t}")
+        
+        # Bag 时间间隔检查
+        if len(self._bag_infos) > 1:
+            gaps = quality_checker.check_bag_time_gaps(self._bag_infos)
+            if quality_checker.report.has_significant_gaps:
+                print(f"\n[⚠️ Bag 时间间隔] (最大 {max(g.gap_seconds for g in gaps):.2f}s)")
         
         self._log_memory("开始前")
         
@@ -882,6 +1386,33 @@ class KPIAnalyzer:
             
             total_frames = len(cached_store)
             bag_names = cached_store.get_bag_names()
+            
+            # 加载高频数据
+            highfreq_stats = cached_store.get_highfreq_stats()
+            if highfreq_stats['chassis_highfreq'] > 0 or highfreq_stats['control_highfreq'] > 0:
+                print(f"  加载高频数据: chassis={highfreq_stats['chassis_highfreq']:,}, control={highfreq_stats['control_highfreq']:,}")
+                
+                # 加载底盘高频数据
+                if highfreq_stats['chassis_highfreq'] > 0:
+                    chassis_data, chassis_auto = cached_store.load_chassis_highfreq()
+                    streaming_data.chassis_highfreq.extend(chassis_data)
+                    streaming_data.chassis_auto_states.extend(chassis_auto)
+                
+                # 加载控制高频数据
+                if highfreq_stats['control_highfreq'] > 0:
+                    control_data, control_auto = cached_store.load_control_highfreq()
+                    streaming_data.control_highfreq.extend(control_data)
+                    streaming_data.control_auto_states.extend(control_auto)
+            else:
+                print(f"  [WARN] 缓存不包含高频数据（旧版本缓存），转向/画龙/舒适性 KPI 将使用 10Hz 同步帧")
+            
+            # 加载 Planning 调试数据
+            if not self.disable_planning_debug:
+                planning_count = highfreq_stats.get('planning_debug', 0)
+                if planning_count > 0:
+                    print(f"  加载 Planning 调试数据: {planning_count:,} 条")
+                    planning_data = cached_store.load_planning_debug()
+                    streaming_data.planning_debug_data.extend(planning_data)
             
             # 初始化控制调试解析器
             if self.control_parser is None:
@@ -927,6 +1458,32 @@ class KPIAnalyzer:
                             }
                             debug_count += 1
                     
+                    # 从帧中提取场景数据（map_lanes_data 和 trajectory_lane_ids）
+                    map_topic = Topics.MAP
+                    if map_topic in frame.messages:
+                        map_msg = frame.messages[map_topic]
+                        if hasattr(map_msg, 'lanes') and map_msg.lanes:
+                            lanes_at_time = {}
+                            for lane in map_msg.lanes:
+                                lane_id = str(lane.id) if hasattr(lane, 'id') else str(getattr(lane, 'lane_id', ''))
+                                lane_type = getattr(lane, 'lane_type', None)
+                                if lane_type is None:
+                                    lane_type = getattr(lane, 'type', 0)
+                                lanes_at_time[lane_id] = {
+                                    'lane_id': lane_id,
+                                    'turn': getattr(lane, 'turn', 1),
+                                    'junction_id': getattr(lane, 'junction_id', None) or None,
+                                    'type': lane_type
+                                }
+                            streaming_data.map_lanes_data.append((frame.timestamp, lanes_at_time))
+                    
+                    traj_topic = Topics.PLANNING_TRAJECTORY
+                    if traj_topic in frame.messages:
+                        traj_msg = frame.messages[traj_topic]
+                        lane_ids = getattr(traj_msg, 'lane_id', None)
+                        if lane_ids is not None and lane_ids:
+                            streaming_data.trajectory_lane_ids.append((list(lane_ids), frame.timestamp))
+                    
                     # 每 5000 帧处理一次，控制内存
                     if len(frames_batch) >= 5000:
                         for kpi in streaming_kpis:
@@ -953,6 +1510,10 @@ class KPIAnalyzer:
                 self._log_memory(f"[{idx+1}/{len(bag_names)}] 加载后")
             
             print(f"\n  加载完成: 共 {total_frames:,} 帧, 解析 {debug_count:,} 条调试数据")
+            
+            # 打印场景数据统计
+            if streaming_data.map_lanes_data or streaming_data.trajectory_lane_ids:
+                print(f"  场景数据: map帧={len(streaming_data.map_lanes_data):,}, trajectory帧={len(streaming_data.trajectory_lane_ids):,}")
             
         else:
             # ===== 首次处理：读取 bag + 写入缓存 =====
@@ -998,51 +1559,109 @@ class KPIAnalyzer:
             total_items = len(iterate_items)
             total_frames = 0
             
-            for item_idx, (item_path, bag_info_obj) in enumerate(iterate_items):
-                item_name = Path(item_path).name
-                print(f"\n  [{item_idx+1}/{total_items}] 处理: {item_name}")
+            failed_bags = []  # 记录失败的 bag
+            
+            # ===== 并行读取优化 =====
+            # 使用预读取：在处理当前 bag 时并行读取下 N 个 bag
+            prefetch_count = max(1, min(parallel_bags, 4))  # 最多预读取 4 个
+            
+            def read_bag_data(item_path_str: str):
+                """读取单个 bag 的数据（用于并行）"""
+                try:
+                    reader = BagReader(item_path_str)
+                    data = reader.read_topics(topics_to_read, progress=False, light_mode=True)
+                    return data, None
+                except Exception as e:
+                    return None, str(e)
+            
+            if prefetch_count > 1 and total_items > 1:
+                print(f"\n  [并行模式] 预读取 {prefetch_count} 个 bag")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 
-                # 读取单个 bag/db3 的数据
-                single_reader = BagReader(str(item_path))
-                topic_data = single_reader.read_topics(topics_to_read, progress=False, light_mode=True)
-                
-                msg_count = sum(len(td.messages) for td in topic_data.values())
-                print(f"      读取消息: {msg_count:,} 条")
-                
-                # 解析控制调试数据
-                debug_topic = Topics.CONTROL_DEBUG
-                if debug_topic in topic_data:
-                    if self.control_parser is None:
-                        self.control_parser = ControlDebugParser()
-                    topic = topic_data[debug_topic]
-                    parsed = self.control_parser.batch_parse(topic.messages, topic.timestamps)
-                    global_parsed_debug_data.update(parsed)
-                
-                # 时间同步
-                synced_frames = self._synchronize_single_bag_data(topic_data)
-                print(f"      同步帧数: {len(synced_frames)}")
-                total_frames += len(synced_frames)
-                
-                # 写入缓存（如果启用）
-                if disk_store is not None and synced_frames:
-                    disk_store.append_batch(synced_frames, item_name)
-                
-                # 直接调用所有 KPI 的 collect（核心优化点！）
-                for kpi in streaming_kpis:
+                # 使用线程池预读取
+                with ThreadPoolExecutor(max_workers=prefetch_count) as executor:
+                    # 提交所有读取任务
+                    future_to_idx = {}
+                    for idx, (item_path, _) in enumerate(iterate_items):
+                        future = executor.submit(read_bag_data, str(item_path))
+                        future_to_idx[future] = idx
+                    
+                    # 收集结果（按提交顺序）
+                    results_cache = {}
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        results_cache[idx] = future.result()
+                    
+                    # 按顺序处理结果
+                    for item_idx in range(total_items):
+                        item_path, bag_info_obj = iterate_items[item_idx]
+                        item_name = Path(item_path).name
+                        print(f"\n  [{item_idx+1}/{total_items}] 处理: {item_name}")
+                        
+                        topic_data, error = results_cache[item_idx]
+                        if error:
+                            print(f"      [错误] 读取失败: {error}")
+                            failed_bags.append((item_name, error))
+                            continue
+                        
+                        msg_count = sum(len(td.messages) for td in topic_data.values())
+                        print(f"      读取消息: {msg_count:,} 条")
+                        
+                        # 处理数据（与原逻辑相同）
+                        self._process_single_bag_streaming(
+                            topic_data, item_name, item_idx, total_items,
+                            streaming_data, streaming_kpis, global_parsed_debug_data,
+                            disk_store
+                        )
+                        total_frames += self._last_synced_frame_count
+                        
+                        # 释放内存
+                        for td in topic_data.values():
+                            td.clear()
+                        topic_data.clear()
+                        gc.collect()
+                        
+                        self._log_memory(f"[{item_idx+1}/{total_items}] 处理后")
+            else:
+                # 原始单线程模式
+                for item_idx, (item_path, bag_info_obj) in enumerate(iterate_items):
+                    item_name = Path(item_path).name
+                    print(f"\n  [{item_idx+1}/{total_items}] 处理: {item_name}")
+                    
                     try:
-                        kpi.collect(synced_frames, streaming_data,
-                                   parsed_debug_data=global_parsed_debug_data)
-                    except Exception:
-                        pass
-                
-                # 释放内存
-                for td in topic_data.values():
-                    td.clear()
-                topic_data.clear()
-                synced_frames.clear()
-                gc.collect()
-                
-                self._log_memory(f"[{item_idx+1}/{total_items}] 处理后")
+                        # 读取单个 bag/db3 的数据
+                        single_reader = BagReader(str(item_path))
+                        topic_data = single_reader.read_topics(topics_to_read, progress=False, light_mode=True)
+                    except Exception as e:
+                        print(f"      [错误] 读取失败: {e}")
+                        failed_bags.append((item_name, str(e)))
+                        continue  # 跳过此 bag，继续处理下一个
+                    
+                    msg_count = sum(len(td.messages) for td in topic_data.values())
+                    print(f"      读取消息: {msg_count:,} 条")
+                    
+                    # 处理数据
+                    self._process_single_bag_streaming(
+                        topic_data, item_name, item_idx, total_items,
+                        streaming_data, streaming_kpis, global_parsed_debug_data,
+                        disk_store
+                    )
+                    total_frames += self._last_synced_frame_count
+                    
+                    # 释放内存
+                    for td in topic_data.values():
+                        td.clear()
+                    topic_data.clear()
+                    gc.collect()
+                    
+                    self._log_memory(f"[{item_idx+1}/{total_items}] 处理后")
+            
+            # 汇总失败的 bag
+            if failed_bags:
+                print(f"\n  [警告] {len(failed_bags)} 个 bag 处理失败:")
+                for bag_name, error_msg in failed_bags:
+                    print(f"    - {bag_name}: {error_msg[:80]}")
+                print(f"  成功处理: {total_items - len(failed_bags)}/{total_items} 个 bag")
             
             print(f"\n  处理完成: 共 {total_frames:,} 帧")
             
@@ -1050,7 +1669,9 @@ class KPIAnalyzer:
             if disk_store is not None:
                 disk_store.finalize()
                 cache.save_meta(bag_path, disk_store)
-                print(f"  缓存已保存: {len(disk_store):,} 帧")
+                highfreq_stats = disk_store.get_highfreq_stats()
+                planning_debug_count = highfreq_stats.get('planning_debug', 0)
+                print(f"  缓存已保存: {len(disk_store):,} 帧, 高频: chassis={highfreq_stats['chassis_highfreq']:,}, control={highfreq_stats['control_highfreq']:,}, planning_debug={planning_debug_count:,}")
         
         self._timing_stats.add_step("2.读取+收集", time.perf_counter() - step_start)
         
@@ -1118,6 +1739,16 @@ class KPIAnalyzer:
         
         self._timing_stats.add_step("3.计算KPI", time.perf_counter() - step_start)
         
+        # 为所有 anomaly 添加场景信息（在释放数据之前）
+        if streaming_data.map_lanes_data and streaming_data.trajectory_lane_ids:
+            print(f"  [场景标注] 为 {len(self.reporter.results)} 个结果添加场景信息...")
+            self._enrich_anomalies_with_scene(self.reporter.results, streaming_data)
+            
+            # 计算路口通过率
+            junction_pass_rate = self._compute_junction_pass_rate(self.reporter.results, streaming_data)
+            if junction_pass_rate:
+                self.reporter.set_junction_pass_rate(junction_pass_rate)
+        
         # 释放 StreamingData
         streaming_data.clear()
         gc.collect()
@@ -1125,6 +1756,10 @@ class KPIAnalyzer:
         # ========== 阶段3: 生成报告 ==========
         print(f"\n[阶段3] 生成报告...")
         step_start = time.perf_counter()
+        
+        # 设置数据质量信息到报告元数据
+        quality_report = quality_checker.get_report()
+        self.reporter.set_data_quality(quality_report.to_dict())
         
         self.reporter.set_timing_stats(self._timing_stats.to_dict())
         report_files = self.reporter.generate_all_reports()
@@ -1185,7 +1820,7 @@ class KPIAnalyzer:
         total_start = time.perf_counter()
         
         # 初始化 KPI 计算器
-        self._init_kpi_calculators()
+        self._init_kpi_calculators(self.only_kpi)
         
         # 检测 bag 结构
         bag_path_obj = Path(bag_path)
@@ -1288,12 +1923,43 @@ class KPIAnalyzer:
         global_parsed_debug_data = {}
         all_bag_infos = []
         
+        # 初始化 streaming_data（用于高频数据）
+        from .kpi.base_kpi import StreamingData
+        streaming_data = StreamingData()
+        
         # ========== 第一阶段：逐个处理并写入 FrameStore ==========
         if use_cached:
             # 使用缓存，跳过数据读取
             print(f"\n[阶段1] 跳过（使用缓存）")
             # 转换为 multi_bag_reader.BagInfo 格式（用于 KPI 事件溯源）
             all_bag_infos = [info.to_multi_bag_info() for info in frame_store.get_bag_infos()]
+            
+            # 从缓存加载高频数据
+            highfreq_stats = frame_store.get_highfreq_stats()
+            if highfreq_stats['chassis_highfreq'] > 0 or highfreq_stats['control_highfreq'] > 0:
+                print(f"  加载高频数据: chassis={highfreq_stats['chassis_highfreq']:,}, control={highfreq_stats['control_highfreq']:,}")
+                
+                # 加载底盘高频数据
+                if highfreq_stats['chassis_highfreq'] > 0:
+                    chassis_data, chassis_auto = frame_store.load_chassis_highfreq()
+                    streaming_data.chassis_highfreq.extend(chassis_data)
+                    streaming_data.chassis_auto_states.extend(chassis_auto)
+                
+                # 加载控制高频数据
+                if highfreq_stats['control_highfreq'] > 0:
+                    control_data, control_auto = frame_store.load_control_highfreq()
+                    streaming_data.control_highfreq.extend(control_data)
+                    streaming_data.control_auto_states.extend(control_auto)
+            else:
+                print(f"  [WARN] 缓存不包含高频数据（旧版本缓存），舒适性/转向/画龙 KPI 将使用 10Hz 同步帧")
+            
+            # 加载 Planning 调试数据
+            if not self.disable_planning_debug:
+                planning_count = highfreq_stats.get('planning_debug', 0)
+                if planning_count > 0:
+                    print(f"  加载 Planning 调试数据: {planning_count:,} 条")
+                    planning_data = frame_store.load_planning_debug()
+                    streaming_data.planning_debug_data.extend(planning_data)
             
             # 从缓存帧中重新解析 parsed_debug_data
             print(f"  解析控制调试数据...")
@@ -1349,6 +2015,46 @@ class KPIAnalyzer:
                 msg_count = sum(len(td.messages) for td in topic_data.values())
                 print(f"      读取消息: {msg_count:,} 条")
                 
+                # 创建临时 streaming_data 用于收集本 bag 的高频数据
+                from .kpi.base_kpi import StreamingData
+                temp_streaming = StreamingData()
+                
+                # 收集高频数据（在同步前收集，因为同步会下采样到10Hz）
+                self._collect_highfreq_data(topic_data, temp_streaming)
+                
+                # 累积到全局 streaming_data
+                streaming_data.chassis_highfreq.extend(temp_streaming.chassis_highfreq)
+                streaming_data.chassis_auto_states.extend(temp_streaming.chassis_auto_states)
+                streaming_data.control_highfreq.extend(temp_streaming.control_highfreq)
+                streaming_data.control_auto_states.extend(temp_streaming.control_auto_states)
+                streaming_data.planning_debug_data.extend(temp_streaming.planning_debug_data)
+                
+                if temp_streaming.chassis_highfreq:
+                    print(f"      高频数据: chassis +{len(temp_streaming.chassis_highfreq):,}, control +{len(temp_streaming.control_highfreq):,}")
+                
+                # 写入高频数据到缓存（按 bag 分开存储）
+                if isinstance(frame_store, DiskFrameStore):
+                    if temp_streaming.chassis_highfreq:
+                        frame_store.append_chassis_highfreq(
+                            temp_streaming.chassis_highfreq,
+                            temp_streaming.chassis_auto_states,
+                            item_name
+                        )
+                    if temp_streaming.control_highfreq:
+                        frame_store.append_control_highfreq(
+                            temp_streaming.control_highfreq,
+                            temp_streaming.control_auto_states,
+                            item_name
+                        )
+                    if temp_streaming.planning_debug_data:
+                        frame_store.append_planning_debug(
+                            temp_streaming.planning_debug_data,
+                            item_name
+                        )
+                
+                # 清理临时数据
+                temp_streaming.clear()
+                
                 # 解析控制调试数据
                 debug_topic = Topics.CONTROL_DEBUG
                 if debug_topic in topic_data:
@@ -1378,6 +2084,8 @@ class KPIAnalyzer:
             frame_store.finalize()
             
             print(f"\n  写入完成: 共 {len(frame_store):,} 帧")
+            print(f"  高频数据: chassis={len(streaming_data.chassis_highfreq):,}, control={len(streaming_data.control_highfreq):,}")
+            
             if isinstance(frame_store, DiskFrameStore):
                 stats = frame_store.get_stats()
                 print(f"  磁盘占用: {stats['db_size_mb']:.1f} MB")
@@ -1411,9 +2119,7 @@ class KPIAnalyzer:
         
         # ========== 流式处理：一次遍历，所有 KPI 并行 collect ==========
         # 这样避免 list(frame_store) 导致的 OOM 问题
-        from .kpi.base_kpi import StreamingData
-        
-        streaming_data = StreamingData()
+        # 注：streaming_data 已在前面创建，包含高频数据
         streaming_data.bag_infos = list(self._bag_infos)
         
         # 收集所有支持流式处理的 KPI
@@ -1515,6 +2221,16 @@ class KPIAnalyzer:
             synced_frames_list.clear()
         
         self._timing_stats.add_step("3.计算KPI", time.perf_counter() - step_start)
+        
+        # 为所有 anomaly 添加场景信息（在释放数据之前）
+        if streaming_data.map_lanes_data and streaming_data.trajectory_lane_ids:
+            print(f"  [场景标注] 为 {len(self.reporter.results)} 个结果添加场景信息...")
+            self._enrich_anomalies_with_scene(self.reporter.results, streaming_data)
+            
+            # 计算路口通过率
+            junction_pass_rate = self._compute_junction_pass_rate(self.reporter.results, streaming_data)
+            if junction_pass_rate:
+                self.reporter.set_junction_pass_rate(junction_pass_rate)
         
         # 释放内存
         streaming_data.clear()
@@ -1729,6 +2445,10 @@ def main():
                         type=int,
                         default=8,
                         help='并行计算KPI的线程数 (默认: 8)')
+    parser.add_argument('-p', '--parallel-bags',
+                        type=int,
+                        default=1,
+                        help='并行读取bag数量，用于加速流式模式 (默认: 1单线程，建议32G内存设为4-6)')
     parser.add_argument('--no-cache',
                         action='store_true',
                         help='禁用持久化缓存')
@@ -1741,6 +2461,13 @@ def main():
     parser.add_argument('-v', '--verbose',
                         action='store_true',
                         help='详细输出')
+    parser.add_argument('--kpi',
+                        type=str,
+                        default=None,
+                        help='只运行指定的KPI（如: 画龙检测, 方向盘平顺性）')
+    parser.add_argument('--with-planning-debug',
+                        action='store_true',
+                        help='启用 planning debug 数据处理（默认禁用）')
     
     args = parser.parse_args()
     
@@ -1766,13 +2493,16 @@ def main():
         use_cache=use_cache,
         cache_dir=args.cache_dir
     )
+    analyzer.only_kpi = args.kpi  # 单 KPI 模式
+    analyzer.disable_planning_debug = not args.with_planning_debug  # 默认禁用，需要时启用
     
     try:
         # 选择分析模式
         if args.true_streaming:
-            # 流式模式：内存最优 + 可选缓存
+            # 流式模式：内存最优 + 可选缓存 + 可选并行
             results = analyzer.analyze_true_streaming(
-                args.bag_path, args.output, use_cache=use_cache)
+                args.bag_path, args.output, use_cache=use_cache,
+                parallel_bags=args.parallel_bags)
         elif args.force_disk:
             # 强制磁盘模式
             results = analyzer.analyze_with_frame_store(

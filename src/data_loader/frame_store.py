@@ -45,14 +45,27 @@ class FrameStoreCache:
     """
     持久化缓存管理器
     
-    缓存 synced_frames 数据，基于 bag 文件哈希校验有效性。
+    缓存 synced_frames 数据和高频数据，基于 bag 文件哈希校验有效性。
+    支持配置指纹验证，防止配置变更导致缓存污染。
     """
     
-    CACHE_VERSION = "2.0"
+    CACHE_VERSION = "3.2"  # 3.2: 添加 planning_debug 表
     
-    def __init__(self, cache_dir: str = ".frame_cache"):
+    def __init__(self, cache_dir: str = ".frame_cache", config: dict = None):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.config = config or {}
+        self._config_fingerprint = self._compute_config_fingerprint()
+    
+    def _compute_config_fingerprint(self) -> str:
+        """计算配置指纹"""
+        try:
+            from src.utils.data_quality import compute_config_fingerprint
+            return compute_config_fingerprint(self.config)
+        except ImportError:
+            # 回退到简单哈希
+            import hashlib
+            return hashlib.md5(str(self.config).encode()).hexdigest()[:16]
     
     def _compute_bag_hash(self, bag_path: str) -> str:
         """
@@ -94,8 +107,14 @@ class FrameStoreCache:
         """获取缓存元数据路径"""
         return self.cache_dir / f"frames_{bag_hash}.json"
     
-    def is_valid(self, bag_path: str) -> bool:
-        """检查缓存是否有效"""
+    def is_valid(self, bag_path: str, strict_config: bool = False) -> bool:
+        """
+        检查缓存是否有效
+        
+        Args:
+            bag_path: bag 文件路径
+            strict_config: 是否严格检查配置指纹（默认 False，配置变更时仅警告）
+        """
         bag_hash = self._compute_bag_hash(bag_path)
         meta_path = self._get_meta_path(bag_hash)
         cache_path = self._get_cache_path(bag_hash)
@@ -112,10 +131,22 @@ class FrameStoreCache:
                 logger.info(f"缓存版本不匹配: {meta.get('version')} != {self.CACHE_VERSION}")
                 return False
             
-            # 检查哈希
+            # 检查 bag 哈希
             if meta.get('bag_hash') != bag_hash:
                 logger.info("Bag 文件已变更，缓存失效")
                 return False
+            
+            # 检查配置指纹
+            cached_config_fp = meta.get('config_fingerprint', '')
+            if cached_config_fp and cached_config_fp != self._config_fingerprint:
+                if strict_config:
+                    logger.info(f"配置已变更，缓存失效 (旧: {cached_config_fp[:8]}... 新: {self._config_fingerprint[:8]}...)")
+                    return False
+                else:
+                    logger.warning(
+                        f"配置已变更 (旧: {cached_config_fp[:8]}... 新: {self._config_fingerprint[:8]}...)，"
+                        "使用 --clear-cache 重建缓存以确保结果准确"
+                    )
             
             return True
         except Exception as e:
@@ -163,6 +194,18 @@ class FrameStoreCache:
         bag_hash = self._compute_bag_hash(bag_path)
         meta_path = self._get_meta_path(bag_hash)
         
+        # 获取高频数据统计
+        highfreq_stats = frame_store.get_highfreq_stats()
+        
+        # 获取代码版本
+        try:
+            from src.utils.data_quality import get_code_version
+            code_version = get_code_version()
+        except ImportError:
+            code_version = "unknown"
+        
+        from datetime import datetime
+        
         meta = {
             'version': self.CACHE_VERSION,
             'bag_hash': bag_hash,
@@ -172,13 +215,18 @@ class FrameStoreCache:
                 {'name': info.name, 'frame_count': info.frame_count,
                  'start_timestamp': info.start_timestamp, 'end_timestamp': info.end_timestamp}
                 for info in frame_store.get_bag_infos()
-            ]
+            ],
+            'highfreq_stats': highfreq_stats,
+            # 版本化信息
+            'config_fingerprint': self._config_fingerprint,
+            'code_version': code_version,
+            'created_at': datetime.now().isoformat()
         }
         
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
         
-        logger.info(f"缓存元数据已保存: {meta_path}")
+        logger.info(f"缓存元数据已保存: {meta_path} (config: {self._config_fingerprint[:8]}..., code: {code_version})")
     
     def get_cache_path_for_bag(self, bag_path: str) -> str:
         """获取 bag 对应的缓存路径（用于 DiskFrameStore）"""
@@ -403,7 +451,7 @@ class DiskFrameStore(FrameStore):
         
         conn = sqlite3.connect(self.db_path)
         
-        # 创建帧表
+        # 创建帧表（10Hz 同步帧）
         conn.execute("""
             CREATE TABLE frames (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -421,6 +469,46 @@ class DiskFrameStore(FrameStore):
                 frame_count INTEGER,
                 start_timestamp REAL,
                 end_timestamp REAL
+            )
+        """)
+        
+        # 创建高频底盘数据表 (~50Hz)
+        # (steering_angle, steering_vel, speed, lat_acc, timestamp, is_auto)
+        conn.execute("""
+            CREATE TABLE chassis_highfreq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                bag_name TEXT,
+                steering_angle REAL,
+                steering_vel REAL,
+                speed REAL,
+                lat_acc REAL,
+                is_auto INTEGER
+            )
+        """)
+        
+        # 创建高频控制数据表 (~50Hz)
+        # (lon_acc, timestamp, is_auto)
+        conn.execute("""
+            CREATE TABLE control_highfreq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                bag_name TEXT,
+                lon_acc REAL,
+                is_auto INTEGER
+            )
+        """)
+        
+        # 创建 Planning 调试数据表 (~10Hz 或更低)
+        # (present_status, trajectory_type, is_replan, timestamp)
+        conn.execute("""
+            CREATE TABLE planning_debug (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                bag_name TEXT,
+                present_status TEXT,
+                trajectory_type INTEGER,
+                is_replan INTEGER
             )
         """)
         
@@ -529,6 +617,9 @@ class DiskFrameStore(FrameStore):
         
         # 创建时间戳索引
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON frames(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chassis_ts ON chassis_highfreq(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_control_ts ON control_highfreq(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_debug_ts ON planning_debug(timestamp)")
         
         # 分析优化
         conn.execute("ANALYZE")
@@ -538,6 +629,204 @@ class DiskFrameStore(FrameStore):
         
         self._finalized = True
         logger.info(f"DiskFrameStore: 完成索引，共 {self._frame_count:,} 帧")
+    
+    # ========== 高频数据写入/读取方法 ==========
+    
+    def append_chassis_highfreq(self, data: List[tuple], auto_states: List[tuple], bag_name: str):
+        """
+        批量写入高频底盘数据
+        
+        Args:
+            data: [(steering_angle, steering_vel, speed, lat_acc, timestamp), ...]
+            auto_states: [(is_auto, timestamp), ...] 与 data 一一对应
+            bag_name: 来源 bag 名称
+        """
+        if not data:
+            return
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        # 批量插入
+        data_to_insert = []
+        for i, (steering_angle, steering_vel, speed, lat_acc, ts) in enumerate(data):
+            is_auto = auto_states[i][0] if i < len(auto_states) else False
+            data_to_insert.append((ts, bag_name, steering_angle, steering_vel, speed, lat_acc, int(is_auto)))
+        
+        conn.executemany(
+            "INSERT INTO chassis_highfreq (timestamp, bag_name, steering_angle, steering_vel, speed, lat_acc, is_auto) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            data_to_insert
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        logger.debug(f"DiskFrameStore: 写入 {len(data):,} 条高频底盘数据 from {bag_name}")
+    
+    def append_control_highfreq(self, data: List[tuple], auto_states: List[tuple], bag_name: str):
+        """
+        批量写入高频控制数据
+        
+        Args:
+            data: [(lon_acc, timestamp), ...]
+            auto_states: [(is_auto, timestamp), ...] 与 data 一一对应
+            bag_name: 来源 bag 名称
+        """
+        if not data:
+            return
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        # 批量插入
+        data_to_insert = []
+        for i, (lon_acc, ts) in enumerate(data):
+            is_auto = auto_states[i][0] if i < len(auto_states) else False
+            data_to_insert.append((ts, bag_name, lon_acc, int(is_auto)))
+        
+        conn.executemany(
+            "INSERT INTO control_highfreq (timestamp, bag_name, lon_acc, is_auto) VALUES (?, ?, ?, ?)",
+            data_to_insert
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        logger.debug(f"DiskFrameStore: 写入 {len(data):,} 条高频控制数据 from {bag_name}")
+    
+    def load_chassis_highfreq(self) -> tuple:
+        """
+        加载所有高频底盘数据
+        
+        Returns:
+            (chassis_data, auto_states) 两个列表
+            chassis_data: [(steering_angle, steering_vel, speed, lat_acc, timestamp), ...]
+            auto_states: [(is_auto, timestamp), ...]
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT steering_angle, steering_vel, speed, lat_acc, timestamp, is_auto FROM chassis_highfreq ORDER BY timestamp"
+        )
+        
+        chassis_data = []
+        auto_states = []
+        
+        while True:
+            rows = cursor.fetchmany(self.BATCH_SIZE)
+            if not rows:
+                break
+            
+            for row in rows:
+                steering_angle, steering_vel, speed, lat_acc, ts, is_auto = row
+                chassis_data.append((steering_angle, steering_vel, speed, lat_acc, ts))
+                auto_states.append((bool(is_auto), ts))
+        
+        conn.close()
+        return chassis_data, auto_states
+    
+    def load_control_highfreq(self) -> tuple:
+        """
+        加载所有高频控制数据
+        
+        Returns:
+            (control_data, auto_states) 两个列表
+            control_data: [(lon_acc, timestamp), ...]
+            auto_states: [(is_auto, timestamp), ...]
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT lon_acc, timestamp, is_auto FROM control_highfreq ORDER BY timestamp"
+        )
+        
+        control_data = []
+        auto_states = []
+        
+        while True:
+            rows = cursor.fetchmany(self.BATCH_SIZE)
+            if not rows:
+                break
+            
+            for row in rows:
+                lon_acc, ts, is_auto = row
+                control_data.append((lon_acc, ts))
+                auto_states.append((bool(is_auto), ts))
+        
+        conn.close()
+        return control_data, auto_states
+    
+    # ========== Planning 调试数据写入/读取方法 ==========
+    
+    def append_planning_debug(self, data: List[tuple], bag_name: str):
+        """
+        批量写入 Planning 调试数据
+        
+        Args:
+            data: [(present_status, trajectory_type, is_replan, timestamp), ...]
+            bag_name: bag 文件名
+        """
+        if not data:
+            return
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        data_to_insert = []
+        for present_status, trajectory_type, is_replan, ts in data:
+            data_to_insert.append((ts, bag_name, present_status, trajectory_type, int(is_replan)))
+        
+        conn.executemany(
+            "INSERT INTO planning_debug (timestamp, bag_name, present_status, trajectory_type, is_replan) VALUES (?, ?, ?, ?, ?)",
+            data_to_insert
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        logger.debug(f"DiskFrameStore: 写入 {len(data):,} 条 Planning 调试数据 from {bag_name}")
+    
+    def load_planning_debug(self) -> List[tuple]:
+        """
+        加载所有 Planning 调试数据
+        
+        Returns:
+            [(present_status, trajectory_type, is_replan, timestamp), ...]
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT present_status, trajectory_type, is_replan, timestamp FROM planning_debug ORDER BY timestamp"
+        )
+        
+        planning_data = []
+        
+        while True:
+            rows = cursor.fetchmany(self.BATCH_SIZE)
+            if not rows:
+                break
+            
+            for row in rows:
+                present_status, trajectory_type, is_replan, ts = row
+                planning_data.append((present_status, trajectory_type, bool(is_replan), ts))
+        
+        conn.close()
+        return planning_data
+    
+    def get_highfreq_stats(self) -> Dict:
+        """获取高频数据和 Planning 调试数据统计"""
+        conn = sqlite3.connect(self.db_path)
+        
+        chassis_count = conn.execute("SELECT COUNT(*) FROM chassis_highfreq").fetchone()[0]
+        control_count = conn.execute("SELECT COUNT(*) FROM control_highfreq").fetchone()[0]
+        
+        # 检查 planning_debug 表是否存在（兼容旧版缓存）
+        try:
+            planning_count = conn.execute("SELECT COUNT(*) FROM planning_debug").fetchone()[0]
+        except sqlite3.OperationalError:
+            planning_count = 0
+        
+        conn.close()
+        
+        return {
+            'chassis_highfreq': chassis_count,
+            'control_highfreq': control_count,
+            'planning_debug': planning_count
+        }
     
     def cleanup(self):
         """清理缓存文件（持久化模式下跳过）"""

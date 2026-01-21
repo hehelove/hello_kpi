@@ -7,6 +7,13 @@ from typing import Tuple, List, Optional
 from dataclasses import dataclass
 import numpy as np
 
+# 尝试导入 Shapely
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon, Point as ShapelyPoint
+    HAS_SHAPELY = True
+except ImportError:
+    HAS_SHAPELY = False
+
 
 @dataclass
 class Point:
@@ -250,17 +257,127 @@ def check_box_in_roi(box: BoundingBox, roi: Rectangle) -> bool:
     检查边界框是否与ROI相交
     
     Args:
-        box: 障碍物边界框
-        roi: ROI矩形 (自车局部坐标系)
+        box: 障碍物边界框（可能有旋转）
+        roi: ROI矩形 (自车局部坐标系，轴对齐)
         
     Returns:
         是否相交
     """
-    # 获取box的轴对齐外接矩形
-    aabb = box.get_axis_aligned_bounds()
+    # 获取 box 的四个角点
+    box_corners = box.get_corners()
+    box_poly = [(c.x, c.y) for c in box_corners]
     
-    # 检查是否与ROI相交
-    return roi.intersects(aabb)
+    # ROI 的四个角点
+    roi_poly = [
+        (roi.x_min, roi.y_min),
+        (roi.x_max, roi.y_min),
+        (roi.x_max, roi.y_max),
+        (roi.x_min, roi.y_max),
+    ]
+    
+    if HAS_SHAPELY:
+        # 使用 Shapely 精确计算
+        return ShapelyPolygon(box_poly).intersects(ShapelyPolygon(roi_poly))
+    else:
+        # 回退到 SAT
+        return _sat_intersects(box_poly, roi_poly)
+
+
+def check_box_in_circle(box: BoundingBox, center_x: float, center_y: float, 
+                        radius: float) -> bool:
+    """
+    检查边界框是否与圆相交
+    
+    Args:
+        box: 障碍物边界框
+        center_x, center_y: 圆心坐标
+        radius: 圆半径
+        
+    Returns:
+        是否相交
+    """
+    box_corners = box.get_corners()
+    box_poly = [(c.x, c.y) for c in box_corners]
+    
+    if HAS_SHAPELY:
+        # 使用 Shapely：创建圆（用 buffer 近似）和多边形
+        circle = ShapelyPoint(center_x, center_y).buffer(radius)
+        polygon = ShapelyPolygon(box_poly)
+        return polygon.intersects(circle)
+    else:
+        # 回退到手动检测
+        return _check_box_circle_fallback(box, box_corners, center_x, center_y, radius)
+
+
+def _check_box_circle_fallback(box: BoundingBox, corners: List[Point],
+                                center_x: float, center_y: float, 
+                                radius: float) -> bool:
+    """回退：手动检测 bbox 与圆是否相交"""
+    # 检查任一角点是否在圆内
+    for c in corners:
+        dist_sq = (c.x - center_x)**2 + (c.y - center_y)**2
+        if dist_sq <= radius * radius:
+            return True
+    
+    # 检查圆心是否在 box 内
+    if box.contains_point(center_x, center_y):
+        return True
+    
+    # 检查圆是否与 box 的任一边相交
+    for i in range(len(corners)):
+        p1 = corners[i]
+        p2 = corners[(i + 1) % len(corners)]
+        dist = _point_to_segment_distance(center_x, center_y, p1.x, p1.y, p2.x, p2.y)
+        if dist <= radius:
+            return True
+    
+    return False
+
+
+def _sat_intersects(poly_a: list, poly_b: list) -> bool:
+    """SAT 分离轴定理判断两个凸多边形是否相交（回退方案）"""
+    def get_axes(polygon):
+        axes = []
+        for i in range(len(polygon)):
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % len(polygon)]
+            edge = (p2[0] - p1[0], p2[1] - p1[1])
+            normal = (-edge[1], edge[0])
+            length = math.sqrt(normal[0]**2 + normal[1]**2)
+            if length > 1e-9:
+                axes.append((normal[0] / length, normal[1] / length))
+        return axes
+    
+    def project(polygon, axis):
+        dots = [p[0] * axis[0] + p[1] * axis[1] for p in polygon]
+        return min(dots), max(dots)
+    
+    axes = get_axes(poly_a) + get_axes(poly_b)
+    
+    for axis in axes:
+        min_a, max_a = project(poly_a, axis)
+        min_b, max_b = project(poly_b, axis)
+        if max_a < min_b or max_b < min_a:
+            return False
+    
+    return True
+
+
+def _point_to_segment_distance(px: float, py: float, 
+                                x1: float, y1: float, 
+                                x2: float, y2: float) -> float:
+    """计算点到线段的最近距离"""
+    dx = x2 - x1
+    dy = y2 - y1
+    
+    if dx == 0 and dy == 0:
+        return math.sqrt((px - x1)**2 + (py - y1)**2)
+    
+    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+    nearest_x = x1 + t * dx
+    nearest_y = y1 + t * dy
+    
+    return math.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
 
 
 def create_ego_roi(front: float, rear: float, 

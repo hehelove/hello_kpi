@@ -110,7 +110,8 @@ class MapVisualizer:
                                    matched_pairs: List[Any],
                                    output_path: str,
                                    title: str = "Refline 匹配点可视化",
-                                   curvature_threshold: float = 0.002) -> str:
+                                   curvature_threshold: float = 0.003,
+                                   large_curve_threshold: float = 0.02) -> str:
         """
         生成包含自车位置和匹配 refline 点的 HTML 地图文件
         
@@ -118,7 +119,8 @@ class MapVisualizer:
             matched_pairs: 匹配点对列表 (需要有 ego_lat, ego_lon, refline_lat, refline_lon, kappa, distance)
             output_path: 输出 HTML 文件路径
             title: 地图标题
-            curvature_threshold: 曲率阈值，用于区分直道和弯道
+            curvature_threshold: 直道/弯道阈值（曲率<此值为直道）
+            large_curve_threshold: 大弯道阈值（曲率>=此值为大弯道/路口转弯）
             
         Returns:
             生成的 HTML 文件路径
@@ -133,15 +135,27 @@ class MapVisualizer:
         # 构建 GeoJSON 数据
         ego_features = []  # 自车位置点
         refline_straight_features = []  # 直道 refline 点
-        refline_curve_features = []  # 弯道 refline 点
+        refline_small_curve_features = []  # 小弯道 refline 点
+        refline_large_curve_features = []  # 大弯道 refline 点
         connection_features = []  # 连接线（自车到最近点）
         
         for i, pair in enumerate(matched_pairs):
-            # 自车位置点 (蓝色)
+            abs_kappa = abs(pair.kappa)
+            
+            # 分类：直道 / 小弯道 / 大弯道
+            if abs_kappa < curvature_threshold:
+                road_type = "straight"
+            elif abs_kappa < large_curve_threshold:
+                road_type = "small_curve"
+            else:
+                road_type = "large_curve"
+            
+            # 自车位置点 (根据道路类型着色)
             ego_features.append({
                 "type": "Feature",
                 "properties": {
                     "type": "ego",
+                    "road_type": road_type,
                     "index": i,
                     "distance": round(pair.distance, 3),
                     "kappa": round(pair.kappa, 6)
@@ -152,12 +166,11 @@ class MapVisualizer:
                 }
             })
             
-            # refline 最近点 (根据曲率分类颜色)
-            is_straight = abs(pair.kappa) < curvature_threshold
+            # refline 最近点 (根据曲率分类)
             refline_feature = {
                 "type": "Feature",
                 "properties": {
-                    "type": "straight" if is_straight else "curve",
+                    "type": road_type,
                     "index": i,
                     "kappa": round(pair.kappa, 6),
                     "distance": round(pair.distance, 3)
@@ -168,10 +181,12 @@ class MapVisualizer:
                 }
             }
             
-            if is_straight:
+            if road_type == "straight":
                 refline_straight_features.append(refline_feature)
+            elif road_type == "small_curve":
+                refline_small_curve_features.append(refline_feature)
             else:
-                refline_curve_features.append(refline_feature)
+                refline_large_curve_features.append(refline_feature)
             
             # 连接线 (自车到最近点) - 只在距离较大时显示
             if pair.distance > 0.1:  # 距离大于 0.1m 才显示连接线
@@ -192,7 +207,8 @@ class MapVisualizer:
         # 创建 GeoJSON FeatureCollections
         ego_collection = {"type": "FeatureCollection", "features": ego_features}
         straight_collection = {"type": "FeatureCollection", "features": refline_straight_features}
-        curve_collection = {"type": "FeatureCollection", "features": refline_curve_features}
+        small_curve_collection = {"type": "FeatureCollection", "features": refline_small_curve_features}
+        large_curve_collection = {"type": "FeatureCollection", "features": refline_large_curve_features}
         connection_collection = {"type": "FeatureCollection", "features": connection_features}
         
         # 生成 HTML
@@ -201,13 +217,16 @@ class MapVisualizer:
             center_lon=center_lon,
             ego_json=json.dumps(ego_collection),
             straight_json=json.dumps(straight_collection),
-            curve_json=json.dumps(curve_collection),
+            small_curve_json=json.dumps(small_curve_collection),
+            large_curve_json=json.dumps(large_curve_collection),
             connection_json=json.dumps(connection_collection),
             title=title,
             curvature_threshold=curvature_threshold,
+            large_curve_threshold=large_curve_threshold,
             total_pairs=len(matched_pairs),
             straight_count=len(refline_straight_features),
-            curve_count=len(refline_curve_features)
+            small_curve_count=len(refline_small_curve_features),
+            large_curve_count=len(refline_large_curve_features)
         )
         
         # 确保输出目录存在
@@ -223,14 +242,17 @@ class MapVisualizer:
                                      center_lon: float,
                                      ego_json: str,
                                      straight_json: str,
-                                     curve_json: str,
+                                     small_curve_json: str,
+                                     large_curve_json: str,
                                      connection_json: str,
                                      title: str,
                                      curvature_threshold: float,
+                                     large_curve_threshold: float,
                                      total_pairs: int,
                                      straight_count: int,
-                                     curve_count: int) -> str:
-        """生成匹配点对的 HTML 页面"""
+                                     small_curve_count: int,
+                                     large_curve_count: int) -> str:
+        """生成匹配点对的 HTML 页面（支持直道/小弯道/大弯道三种类型）"""
         
         html = f'''<!DOCTYPE html>
 <html>
@@ -288,7 +310,7 @@ class MapVisualizer:
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             font-size: 13px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            max-width: 300px;
+            max-width: 320px;
         }}
         .info-panel strong {{
             display: block;
@@ -343,19 +365,29 @@ class MapVisualizer:
         <span class="info-value">{straight_count} ({straight_count*100//total_pairs if total_pairs > 0 else 0}%)</span>
     </div>
     <div class="info-row">
-        <span class="info-label">弯道点:</span>
-        <span class="info-value">{curve_count} ({curve_count*100//total_pairs if total_pairs > 0 else 0}%)</span>
+        <span class="info-label">小弯道点:</span>
+        <span class="info-value">{small_curve_count} ({small_curve_count*100//total_pairs if total_pairs > 0 else 0}%)</span>
     </div>
     <div class="info-row">
-        <span class="info-label">曲率阈值:</span>
-        <span class="info-value">{curvature_threshold}</span>
+        <span class="info-label">大弯道点:</span>
+        <span class="info-value">{large_curve_count} ({large_curve_count*100//total_pairs if total_pairs > 0 else 0}%)</span>
+    </div>
+    <div class="info-row">
+        <span class="info-label">直道阈值:</span>
+        <span class="info-value">κ &lt; {curvature_threshold}</span>
+    </div>
+    <div class="info-row">
+        <span class="info-label">大弯道阈值:</span>
+        <span class="info-value">κ ≥ {large_curve_threshold}</span>
     </div>
 </div>
 
 <div class="layer-toggle">
     <strong style="margin-bottom: 8px; display: block;">图层控制</strong>
-    <label><input type="checkbox" id="toggle-ego" checked> 自车位置 (蓝)</label>
-    <label><input type="checkbox" id="toggle-refline" checked> Refline 点</label>
+    <label><input type="checkbox" id="toggle-ego" checked> 自车位置</label>
+    <label><input type="checkbox" id="toggle-straight" checked> 直道 (绿)</label>
+    <label><input type="checkbox" id="toggle-small-curve" checked> 小弯道 (黄)</label>
+    <label><input type="checkbox" id="toggle-large-curve" checked> 大弯道 (红)</label>
     <label><input type="checkbox" id="toggle-connection" checked> 连接线</label>
 </div>
 
@@ -367,11 +399,15 @@ class MapVisualizer:
     </div>
     <div class="legend-item">
         <div class="legend-dot" style="background: #22c55e;"></div>
-        <span>Refline 直道 (κ &lt; {curvature_threshold})</span>
+        <span>直道 (κ &lt; {curvature_threshold})</span>
+    </div>
+    <div class="legend-item">
+        <div class="legend-dot" style="background: #f59e0b;"></div>
+        <span>小弯道 ({curvature_threshold} ≤ κ &lt; {large_curve_threshold})</span>
     </div>
     <div class="legend-item">
         <div class="legend-dot" style="background: #ef4444;"></div>
-        <span>Refline 弯道 (κ ≥ {curvature_threshold})</span>
+        <span>大弯道/路口转弯 (κ ≥ {large_curve_threshold})</span>
     </div>
     <div class="legend-item">
         <div class="legend-line" style="background: #888; border-style: dashed;"></div>
@@ -384,7 +420,8 @@ class MapVisualizer:
     
     const egoData = {ego_json};
     const straightData = {straight_json};
-    const curveData = {curve_json};
+    const smallCurveData = {small_curve_json};
+    const largeCurveData = {large_curve_json};
     const connectionData = {connection_json};
     
     const map = new mapboxgl.Map({{
@@ -427,14 +464,29 @@ class MapVisualizer:
             }}
         }});
         
-        // 添加弯道 refline 点 (红色)
-        map.addSource('curve', {{ 'type': 'geojson', 'data': curveData }});
+        // 添加小弯道 refline 点 (黄色/橙色)
+        map.addSource('small-curve', {{ 'type': 'geojson', 'data': smallCurveData }});
         map.addLayer({{
-            'id': 'curve-points',
+            'id': 'small-curve-points',
             'type': 'circle',
-            'source': 'curve',
+            'source': 'small-curve',
             'paint': {{
                 'circle-radius': 5,
+                'circle-color': '#f59e0b',
+                'circle-opacity': 0.9,
+                'circle-stroke-width': 1,
+                'circle-stroke-color': '#b45309'
+            }}
+        }});
+        
+        // 添加大弯道 refline 点 (红色)
+        map.addSource('large-curve', {{ 'type': 'geojson', 'data': largeCurveData }});
+        map.addLayer({{
+            'id': 'large-curve-points',
+            'type': 'circle',
+            'source': 'large-curve',
+            'paint': {{
+                'circle-radius': 6,
                 'circle-color': '#ef4444',
                 'circle-opacity': 0.9,
                 'circle-stroke-width': 1,
@@ -461,7 +513,8 @@ class MapVisualizer:
         const bounds = new mapboxgl.LngLatBounds();
         egoData.features.forEach(f => bounds.extend(f.geometry.coordinates));
         straightData.features.forEach(f => bounds.extend(f.geometry.coordinates));
-        curveData.features.forEach(f => bounds.extend(f.geometry.coordinates));
+        smallCurveData.features.forEach(f => bounds.extend(f.geometry.coordinates));
+        largeCurveData.features.forEach(f => bounds.extend(f.geometry.coordinates));
         map.fitBounds(bounds, {{ padding: 50 }});
         
         // 添加起点/终点标记
@@ -478,18 +531,24 @@ class MapVisualizer:
         }}
         
         // 点击弹窗
-        ['ego-points', 'straight-points', 'curve-points'].forEach(layerId => {{
+        ['ego-points', 'straight-points', 'small-curve-points', 'large-curve-points'].forEach(layerId => {{
             map.on('click', layerId, (e) => {{
                 const props = e.features[0].properties;
                 const coords = e.features[0].geometry.coordinates;
                 let content = '';
                 
                 if (layerId === 'ego-points') {{
+                    let roadTypeLabel = '直道';
+                    if (props.road_type === 'small_curve') roadTypeLabel = '小弯道';
+                    else if (props.road_type === 'large_curve') roadTypeLabel = '大弯道';
                     content = `<b>自车位置 #${{props.index}}</b><br>
+                               道路类型: ${{roadTypeLabel}}<br>
                                距离最近点: ${{props.distance}}m<br>
                                匹配点曲率: ${{props.kappa}}`;
                 }} else {{
-                    const type = layerId === 'straight-points' ? '直道' : '弯道';
+                    let type = '直道';
+                    if (layerId === 'small-curve-points') type = '小弯道';
+                    else if (layerId === 'large-curve-points') type = '大弯道';
                     content = `<b>Refline ${{type}}点 #${{props.index}}</b><br>
                                曲率: ${{props.kappa}}<br>
                                距自车: ${{props.distance}}m`;
@@ -510,10 +569,14 @@ class MapVisualizer:
     document.getElementById('toggle-ego').addEventListener('change', (e) => {{
         map.setLayoutProperty('ego-points', 'visibility', e.target.checked ? 'visible' : 'none');
     }});
-    document.getElementById('toggle-refline').addEventListener('change', (e) => {{
-        const vis = e.target.checked ? 'visible' : 'none';
-        map.setLayoutProperty('straight-points', 'visibility', vis);
-        map.setLayoutProperty('curve-points', 'visibility', vis);
+    document.getElementById('toggle-straight').addEventListener('change', (e) => {{
+        map.setLayoutProperty('straight-points', 'visibility', e.target.checked ? 'visible' : 'none');
+    }});
+    document.getElementById('toggle-small-curve').addEventListener('change', (e) => {{
+        map.setLayoutProperty('small-curve-points', 'visibility', e.target.checked ? 'visible' : 'none');
+    }});
+    document.getElementById('toggle-large-curve').addEventListener('change', (e) => {{
+        map.setLayoutProperty('large-curve-points', 'visibility', e.target.checked ? 'visible' : 'none');
     }});
     document.getElementById('toggle-connection').addEventListener('change', (e) => {{
         map.setLayoutProperty('connection-lines', 'visibility', e.target.checked ? 'visible' : 'none');

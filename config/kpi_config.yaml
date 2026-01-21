@@ -65,6 +65,7 @@ frequencies:
     - "/function/function_manager"
     - "/perception/fusion/obstacle_list_utm"
     - "/planning/trajectory"
+    - "/planning/debug"
 
 # KPI阈值配置
 kpi:
@@ -77,12 +78,23 @@ kpi:
     enabled: true
   
   # 3. 直道/弯道判定
+  # 曲率 = 1/半径，曲率越大转弯越急
   road_type:
-    curvature_threshold: 0.003  # 曲率阈值 (1/m), 小于此值为直道
+    curvature_threshold: 0.003    # 直道阈值：曲率<0.003 = 半径>333m
+    large_curve_threshold: 0.02   # 大弯道阈值：曲率>=0.02 = 半径<50m（路口转弯）
+    # 分类：
+    # - 直道：曲率 < 0.003（半径 > 333m）
+    # - 小弯道（正常弯道）：0.003 <= 曲率 < 0.02（半径 50m ~ 333m）
+    # - 大弯道（路口转弯）：曲率 >= 0.02（半径 < 50m）
   
   # 4. 转向平滑度（横向猛打阈值，保留用于紧急事件检测）
   steering:
     enabled: true
+    # 最小持续时间（秒），过滤短暂噪声（50Hz下100ms=5帧）
+    min_duration: 0.1
+    # 事件合并间隔（秒），相邻事件间隔小于此值则合并
+    # 避免一次大幅转向被拆分成多个事件
+    merge_gap: 0.3
     # 转角速度阈值 (°/s)，按速度分段（用于横向猛打检测）
     speed_thresholds:
       0: 200    # 0-10 km/h
@@ -100,7 +112,7 @@ kpi:
       60: 200    # >60 km/h
       30: 250    # >30 km/h
       10: 400    # >10 km/h
-      0: 600     # ≤10 km/h (低速最大允许)
+      0: 600     # ≤10 km/h
   
   # 4.1. 转向平滑度 KPI（新标准）
   steering_smoothness:
@@ -116,7 +128,8 @@ kpi:
     sampling_rate_hz: 50
 
     valid_condition:
-      min_speed_kmh: 1.0
+      min_speed_kmh: 1.0           # 数据采集最低速度
+      min_anomaly_speed_kmh: 10.0  # 异常事件报告最低速度（低速不报异常）
 
     ########################################
     # 2. 信号预处理
@@ -127,14 +140,14 @@ kpi:
         lowpass_filter:
           type: butterworth
           order: 2
-          cutoff_hz: 3.0   # 抑制 EPS 齿隙与量化噪声
+          cutoff_hz: 10.0  # 转角滤波（保留更多有效信号，奈奎斯特25Hz的40%）
 
       steering_angle_rate:
         signal: steering_angle_rate_deg_s
         lowpass_filter:
           type: butterworth
           order: 2
-          cutoff_hz: 5.0   # 保留真实转向动态
+          cutoff_hz: 15.0  # 转角速度滤波（保留快速转向动作，奈奎斯特25Hz的60%）
 
     ########################################
     # 3. 滑动窗口配置
@@ -193,45 +206,45 @@ kpi:
 
       steering_rate_rms:
         - speed_range: [0, 10]
-          warn: 60
-          fail: 80
+          warn: 100
+          fail: 150    # 低速（掉头/泊车）放宽
 
         - speed_range: [10, 20]
-          warn: 50
-          fail: 70
+          warn: 70
+          fail: 100    # 低速转弯放宽
 
         - speed_range: [20, 30]
+          warn: 50
+          fail: 80     # 中低速放宽
+
+        - speed_range: [30, 40]
           warn: 40
           fail: 60
 
-        - speed_range: [30, 40]
-          warn: 35
-          fail: 55
-
         - speed_range: [40, 50]
+          warn: 35
+          fail: 50
+
+        - speed_range: [50, 60]
           warn: 30
           fail: 45
 
-        - speed_range: [50, 60]
+        - speed_range: [60, 80]
           warn: 25
           fail: 40
 
-        - speed_range: [60, 80]
+        - speed_range: [80, 120]
           warn: 20
           fail: 35
 
-        - speed_range: [80, 120]
-          warn: 18
-          fail: 30
-
       steering_rate_p95:
         - speed_range: [0, 10]
-          warn: 90
-          fail: 120
+          warn: 120
+          fail: 180    # 低速放宽
 
         - speed_range: [10, 20]
-          warn: 80
-          fail: 110
+          warn: 100
+          fail: 150    # 低速放宽
 
         - speed_range: [20, 30]
           warn: 70
@@ -401,11 +414,61 @@ kpi:
   # 7. 顿挫检测
   jerk_event:
     jerk_threshold: 2.5  # m/s³
-    min_duration: 0.2  # 200ms
+    min_duration: 0.2    # 200ms，单次超阈值最小持续时间
+    merge_gap: 0.4       # 400ms，两个事件间隔小于此值则合并为一个
+                         # 原因：车辆颠簸通常是"负向冲击→短暂过渡→正向反弹"的模式
+                         # 人体感知振动连续性阈值约 200-500ms，间隔小于 400ms 通常感知为同一次颠簸
   
   # 9. 画龙检测
+  # 画龙 = 行驶时方向盘频繁左右来回打（持续且振幅 >= 40°）
+  # 不过滤曲率，弯道中也可能发生画龙
+  # 正常转弯是持续单向转角，通过"单向变化比例"排除，而非简单振幅阈值
   weaving:
-    lateral_error_threshold: 0.30  # 30cm
+    # 信号滤波配置
+    filter:
+      sampling_rate_hz: 50       # 采样率
+      angle_cutoff_hz: 10.0      # 转角低通滤波截止频率（Hz）
+      rate_cutoff_hz: 15.0       # 转角速度低通滤波截止频率（Hz）
+    
+    # 场景过滤
+    min_speed: 5.0               # km/h，低于此速度不检测（排除低速调头、泊车）
+    # 注意：不过滤曲率，弯道中也可能发生画龙
+    
+    # 振荡检测
+    window_duration: 5.0         # 检测窗口（秒）
+    min_zero_crossings: 4        # 窗口内最小过零点数（4次=2个周期）
+    
+    # 转角速度阈值（与速度相关，用于 RMS 判断）
+    steering_rate_low_speed: 20.0   # <30 km/h: 20°/s
+    steering_rate_mid_speed: 15.0   # 30-60 km/h: 15°/s
+    steering_rate_high_speed: 10.0  # >60 km/h: 10°/s
+    
+    # 有效过零点阈值：已改为动态阈值（按速度分级），此参数废弃
+    # effective_zero_threshold: 10.0   # 度/秒（废弃，使用动态阈值）
+    
+    # 转角峰谷差阈值：振荡幅度需 >= 此值才算画龙（振荡足够明显）
+    min_steering_amplitude: 40.0    # 度，转角峰谷差必须 >= 40° 才算画龙
+    
+    # 事件合并 hysteresis：允许短暂 gap，避免边界抖动导致事件碎片化
+    event_merge_gap: 0.5            # 秒，gap 小于此值的事件会合并
+    
+    # 最大事件持续时间：超过此时长的事件会被自动分割
+    # 真实的画龙事件通常不会持续超过 10 秒
+    max_event_duration: 10.0        # 秒
+    
+    # 排除条件 - 变道检测（累积/净横向位移比）
+    # 变道：单调横向移动，累积位移≈净位移，比值接近1
+    # 画龙：来回移动，累积位移>>净位移，比值远大于1
+    lane_change_ratio_threshold: 1.5   # 累积/净比值 < 此值认为是变道
+    lane_change_min_net_lateral: 0.8   # 米，净横向位移 > 此值 + 比值低 → 变道
+    # 注：正常转弯通过"单向变化比例 > 80%"排除
+    
+    # 持续性要求
+    min_duration: 2.0               # 最小持续时间（秒）
+    min_oscillation_cycles: 2       # 最小振荡周期数
+    
+    # 旧参数（兼容）
+    lateral_error_threshold: 0.30   # 30cm
   
   # 10. ROI障碍物检测 - 三级区域设计
   roi:

@@ -52,10 +52,11 @@ class MultiBagReader:
         """
         发现目录下的所有bag文件夹
         
-        支持两种模式：
+        支持三种模式：
         1. 单bag模式：当前目录直接包含多个连续的.db3文件（如 file_0.db3, file_1.db3 等）
            这些.db3文件会被合并为一个bag读取
         2. 多bag模式：当前目录包含多个子目录，每个子目录是一个独立的bag
+        3. 嵌套模式：支持多层嵌套目录结构（如 trip/bag 结构），递归扫描所有包含.db3的目录
         """
         print(f"  扫描目录: {self.bag_dir}")
         
@@ -68,20 +69,30 @@ class MultiBagReader:
                 print(f"    - {f.name}")
             bag_paths = [self.bag_dir]
         else:
-            # 查找子目录中的bag文件夹
-            print(f"  [模式] 多bag模式 - 扫描子目录...")
-            bag_paths = []
-            for item in sorted(self.bag_dir.iterdir()):
-                if item.is_dir():
-                    # 检查是否是有效的bag文件夹（包含.db3文件）
-                    db3_files = list(item.glob("*.db3"))
-                    if db3_files:
-                        bag_paths.append(item)
+            # 递归查找所有包含.db3文件的目录
+            print(f"  [模式] 多bag模式 - 递归扫描子目录...")
+            bag_paths = self._find_bag_dirs_recursive(self.bag_dir)
         
         if not bag_paths:
             raise ValueError(f"在目录 {self.bag_dir} 中未找到有效的bag文件（需要.db3文件）")
         
         print(f"  发现 {len(bag_paths)} 个bag目录")
+        
+        # ===== 提前验证所有 bag 的有效性 =====
+        print(f"\n  [预检查] 验证所有 bag 文件...")
+        invalid_bags = []
+        for bag_path in bag_paths:
+            issues = self._validate_bag(bag_path)
+            if issues:
+                invalid_bags.append((bag_path, issues))
+        
+        if invalid_bags:
+            print(f"\n  [警告] 发现 {len(invalid_bags)} 个有问题的 bag:")
+            for bag_path, issues in invalid_bags:
+                print(f"    - {bag_path.name}: {', '.join(issues)}")
+            print(f"  [提示] 这些 bag 将被跳过，其余 {len(bag_paths) - len(invalid_bags)} 个 bag 继续处理\n")
+        else:
+            print(f"  [预检查] 所有 {len(bag_paths)} 个 bag 验证通过 ✓\n")
         
         # 读取每个bag的时间信息
         for bag_path in tqdm(bag_paths, desc="读取bag信息"):
@@ -122,6 +133,84 @@ class MultiBagReader:
                 else:
                     print(f"        与前一个bag间隔: {gap:.2f}s (可能有间隔)")
     
+    def _find_bag_dirs_recursive(self, root_dir: Path, max_depth: int = 3) -> List[Path]:
+        """
+        递归查找包含.db3文件的目录
+        
+        Args:
+            root_dir: 根目录
+            max_depth: 最大递归深度，防止无限递归
+            
+        Returns:
+            包含.db3文件的目录列表，按名称排序
+        """
+        bag_dirs = []
+        
+        def scan_dir(current_dir: Path, depth: int):
+            if depth > max_depth:
+                return
+            
+            # 检查当前目录是否包含.db3文件
+            db3_files = list(current_dir.glob("*.db3"))
+            if db3_files:
+                # 当前目录是一个有效的bag目录
+                bag_dirs.append(current_dir)
+                return  # 不再递归进入，因为已经找到bag
+            
+            # 递归扫描子目录
+            try:
+                for item in sorted(current_dir.iterdir()):
+                    if item.is_dir() and not item.name.startswith('.'):
+                        scan_dir(item, depth + 1)
+            except PermissionError:
+                pass  # 忽略权限问题
+        
+        scan_dir(root_dir, 0)
+        
+        # 按目录名排序（确保时间顺序）
+        return sorted(bag_dirs, key=lambda p: p.name)
+    
+    def _validate_bag(self, bag_path: Path) -> List[str]:
+        """
+        快速验证单个 bag 目录的有效性
+        
+        Returns:
+            问题列表，空列表表示验证通过
+        """
+        issues = []
+        
+        # 检查 .db3 文件
+        db3_files = list(bag_path.glob("*.db3"))
+        if not db3_files:
+            issues.append("无 .db3 文件")
+            return issues
+        
+        # 检查 .db3 文件是否可读且非空
+        for db3_file in db3_files:
+            try:
+                if db3_file.stat().st_size == 0:
+                    issues.append(f"{db3_file.name} 为空文件")
+                    continue
+                # 快速检查 SQLite 文件头
+                with open(db3_file, 'rb') as f:
+                    header = f.read(16)
+                    if not header.startswith(b'SQLite format 3'):
+                        issues.append(f"{db3_file.name} 不是有效的 SQLite 文件")
+            except PermissionError:
+                issues.append(f"{db3_file.name} 无读取权限")
+            except Exception as e:
+                issues.append(f"{db3_file.name} 读取错误: {str(e)[:50]}")
+        
+        # 检查 metadata.yaml
+        metadata_path = bag_path / "metadata.yaml"
+        if metadata_path.exists():
+            if metadata_path.stat().st_size == 0:
+                # 空的 metadata.yaml，BagReader 会自动重新生成，标记为警告而非错误
+                pass  # 不算严重问题，会自动修复
+        # 如果 metadata.yaml 不存在也没关系，BagReader 会自动生成
+        
+        return issues
+    
     def get_time_range(self) -> Tuple[float, float]:
         """获取所有bag合并后的时间范围"""
         if not self.bag_infos:
@@ -147,18 +236,22 @@ class MultiBagReader:
         all_topics = {}
         
         for bag_info in self.bag_infos:
-            reader = BagReader(str(bag_info.path))
-            topics = reader.get_topic_info()
-            
-            for topic, info in topics.items():
-                if topic not in all_topics:
-                    all_topics[topic] = {
-                        'type': info.get('type', ''),
-                        'count': 0,
-                        'bags': []
-                    }
-                all_topics[topic]['count'] += info.get('count', 0)
-                all_topics[topic]['bags'].append(bag_info.path.name)
+            try:
+                reader = BagReader(str(bag_info.path))
+                topics = reader.get_topic_info()
+                
+                for topic, info in topics.items():
+                    if topic not in all_topics:
+                        all_topics[topic] = {
+                            'type': info.get('type', ''),
+                            'count': 0,
+                            'bags': []
+                        }
+                    all_topics[topic]['count'] += info.get('count', 0)
+                    all_topics[topic]['bags'].append(bag_info.path.name)
+            except Exception as e:
+                print(f"  [WARN] 跳过损坏的bag {bag_info.path.name}: {e}")
+                continue
         
         return all_topics
     

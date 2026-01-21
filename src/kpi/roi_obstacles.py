@@ -14,8 +14,15 @@ from pathlib import Path
 from src.constants import Topics
 
 from .base_kpi import BaseKPI, KPIResult, BagTimeMapper, AnomalyRecord, StreamingData
+
+# 尝试导入 Shapely（用于精确距离计算）
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon
+    HAS_SHAPELY = True
+except ImportError:
+    HAS_SHAPELY = False
 from ..data_loader.bag_reader import MessageAccessor
-from ..utils.geometry import BoundingBox, Rectangle, create_ego_roi, check_box_in_roi
+from ..utils.geometry import BoundingBox, Rectangle, create_ego_roi, check_box_in_roi, check_box_in_circle
 
 # 尝试导入matplotlib
 try:
@@ -183,20 +190,103 @@ class ObstacleInfo:
     
     @property
     def distance_to_ego(self) -> float:
-        """障碍物边界框到自车边界框的最短距离"""
-        corners = self.get_corners()
-        min_dist = float('inf')
+        """
+        障碍物边界框到自车边界框的最短距离
         
-        for cx, cy in corners:
-            dist = self._point_to_ego_box_distance(cx, cy)
-            min_dist = min(min_dist, dist)
+        优先使用 Shapely（精确欧氏距离），否则回退到 SAT（近似值）
         
-        # 如果障碍物中心在自车边界框内，返回负值（碰撞）
-        if ((-self.ego_rear <= self.position_x <= self.ego_front) and 
-            (-self.ego_right <= self.position_y <= self.ego_left)):
-            return -min_dist
+        Returns:
+            float: 最短距离，0 表示碰撞/重叠
+        """
+        obs_corners = self.get_corners()
+        ego_corners = self._get_ego_corners()
         
-        return min_dist
+        if HAS_SHAPELY:
+            # 使用 Shapely 计算精确距离
+            ego_poly = ShapelyPolygon(ego_corners)
+            obs_poly = ShapelyPolygon(obs_corners)
+            return ego_poly.distance(obs_poly)
+        else:
+            # 回退到 SAT 近似距离
+            return self._sat_distance(ego_corners, obs_corners)
+    
+    def _get_ego_corners(self) -> List[Tuple[float, float]]:
+        """获取自车边界框的四个角点（逆时针顺序）"""
+        return [
+            (self.ego_front, self.ego_left),     # 左前
+            (-self.ego_rear, self.ego_left),     # 左后
+            (-self.ego_rear, -self.ego_right),   # 右后
+            (self.ego_front, -self.ego_right),   # 右前
+        ]
+    
+    def _sat_distance(self, poly_a: List[Tuple[float, float]], 
+                       poly_b: List[Tuple[float, float]]) -> float:
+        """
+        SAT 分离轴定理计算两凸多边形的最短距离
+        
+        Args:
+            poly_a: 多边形 A 的顶点列表（逆时针）
+            poly_b: 多边形 B 的顶点列表（逆时针）
+            
+        Returns:
+            float: 最短距离，0 表示相交
+        """
+        min_separation = float('inf')
+        
+        # 收集所有分离轴（两个多边形的边法向量）
+        axes = []
+        
+        # 多边形 A 的边法向量
+        for i in range(len(poly_a)):
+            p1 = poly_a[i]
+            p2 = poly_a[(i + 1) % len(poly_a)]
+            edge = (p2[0] - p1[0], p2[1] - p1[1])
+            # 法向量（垂直于边，指向外侧）
+            normal = (-edge[1], edge[0])
+            length = np.sqrt(normal[0]**2 + normal[1]**2)
+            if length > 1e-9:
+                axes.append((normal[0] / length, normal[1] / length))
+        
+        # 多边形 B 的边法向量
+        for i in range(len(poly_b)):
+            p1 = poly_b[i]
+            p2 = poly_b[(i + 1) % len(poly_b)]
+            edge = (p2[0] - p1[0], p2[1] - p1[1])
+            normal = (-edge[1], edge[0])
+            length = np.sqrt(normal[0]**2 + normal[1]**2)
+            if length > 1e-9:
+                axes.append((normal[0] / length, normal[1] / length))
+        
+        # 在每个轴上检查投影
+        for axis in axes:
+            # 投影多边形 A
+            proj_a = [p[0] * axis[0] + p[1] * axis[1] for p in poly_a]
+            min_a, max_a = min(proj_a), max(proj_a)
+            
+            # 投影多边形 B
+            proj_b = [p[0] * axis[0] + p[1] * axis[1] for p in poly_b]
+            min_b, max_b = min(proj_b), max(proj_b)
+            
+            # 计算投影间距
+            if max_a < min_b:
+                # A 在 B 左边
+                separation = min_b - max_a
+            elif max_b < min_a:
+                # B 在 A 左边
+                separation = min_a - max_b
+            else:
+                # 投影重叠
+                separation = 0
+            
+            if separation > 0:
+                # 找到分离轴，记录最小间距
+                min_separation = min(min_separation, separation)
+        
+        # 如果 min_separation 仍为 inf，说明所有轴上都重叠 → 相交
+        if min_separation == float('inf'):
+            return 0.0
+        
+        return min_separation
     
     @property
     def direction(self) -> ObstacleDirection:
@@ -1076,7 +1166,7 @@ class ROIObstaclesKPI(BaseKPI):
         
         # 画障碍物
         for obs in frame_data.obstacles:
-            in_near = obs.center_distance <= near_radius
+            in_near = self._check_in_circle(obs, near_radius)
             in_mid = self._check_in_rect(obs, mid_roi) and not in_near
             in_far = self._check_in_rect(obs, far_roi) and not in_near and not in_mid
             
@@ -1126,13 +1216,23 @@ class ROIObstaclesKPI(BaseKPI):
         plt.close(fig)
     
     def _check_in_rect(self, obs: ObstacleInfo, roi: Rectangle) -> bool:
-        """检查障碍物是否在矩形 ROI 内"""
+        """检查障碍物是否在矩形 ROI 内（使用 SAT 精确检测）"""
         obs_box = BoundingBox(
             center_x=obs.position_x, center_y=obs.position_y,
             length=obs.length, width=obs.width,
             yaw=obs.heading_to_ego
         )
         return check_box_in_roi(obs_box, roi)
+    
+    def _check_in_circle(self, obs: ObstacleInfo, radius: float) -> bool:
+        """检查障碍物 bbox 是否与圆形 ROI 相交"""
+        obs_box = BoundingBox(
+            center_x=obs.position_x, center_y=obs.position_y,
+            length=obs.length, width=obs.width,
+            yaw=obs.heading_to_ego
+        )
+        # 圆心在自车后轴中心 (0, 0)
+        return check_box_in_circle(obs_box, 0.0, 0.0, radius)
     
     def _generate_ttc_visualization(self, ttc_data_points: List[TTCDataPoint],
                                       danger_points_with_obs: List[TTCDataPoint] = None):
@@ -1521,8 +1621,8 @@ class ROIObstaclesKPI(BaseKPI):
             # 获取障碍物列表
             obstacles = self._extract_obstacles(obs_msg)
             
-            # 计算三级 ROI 统计
-            near_obs = [obs for obs in obstacles if obs.center_distance <= near_radius]
+            # 计算三级 ROI 统计（使用精确的 bbox 相交检测）
+            near_obs = [obs for obs in obstacles if self._check_in_circle(obs, near_radius)]
             near_stat = self._compute_roi_stats(near_obs)
             mid_stat = self._compute_roi_stats_rect(obstacles, mid_roi)
             far_stat = self._compute_roi_stats_rect(obstacles, far_roi)

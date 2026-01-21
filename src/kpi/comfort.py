@@ -305,84 +305,64 @@ class ComfortKPI(BaseKPI):
         """
         收集加速度数据（流式模式）
         
-        纵向加速度来源：/control/control.chassis_control.target_longitudinal_acceleration
-        
-        Args:
-            synced_frames: 同步后的帧列表
-            streaming_data: 中间数据容器
+        Note:
+            此方法现在不再从 synced_frames 收集数据，
+            而是依赖 main.py 预先收集的高频数据:
+            - control_highfreq (~100Hz): 纵向加速度
         """
-        for frame in synced_frames:
-            fm_msg = frame.messages.get("/function/function_manager")
-            chassis_msg = frame.messages.get("/vehicle/chassis_domain_report")
-            control_msg = frame.messages.get("/control/control")
-            loc_msg = frame.messages.get("/localization/localization")
-            
-            if fm_msg is None or chassis_msg is None:
-                continue
-            
-            operator_type = MessageAccessor.get_field(fm_msg, "operator_type")
-            is_auto = operator_type == self.auto_operator_type
-            
-            if not is_auto:
-                continue
-            
-            # 定位可信度检查
-            if loc_msg is not None:
-                loc_status = MessageAccessor.get_field(loc_msg, "status.common", None)
-                pos_stddev_east = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.east", None)
-                pos_stddev_north = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.north", None)
-                
-                if loc_status is not None and loc_status not in self.loc_valid_status:
-                    continue
-                
-                if pos_stddev_east is not None and pos_stddev_north is not None:
-                    if max(pos_stddev_east, pos_stddev_north) > self.loc_max_stddev:
-                        continue
-            
-            # 获取纵向加速度（优先使用 control topic）
-            lon_acc = None
-            if control_msg is not None:
-                lon_acc = MessageAccessor.get_field(
-                    control_msg, "chassis_control.target_longitudinal_acceleration", None)
-            
-            # 如果 control topic 没有数据，则跳过
-            if lon_acc is None:
-                continue
-            
-            # 获取速度
-            speed = MessageAccessor.get_field(
-                chassis_msg, "motion_system.vehicle_speed", None)  # km/h
-            
-            # 存储: (lon_acc, speed, timestamp)
-            # 注意：低速过滤在 compute_from_collected 中进行，这里保留所有数据
-            streaming_data.accelerations.append((
-                lon_acc,
-                speed,    # 可能为 None (km/h)
-                frame.timestamp
-            ))
+        # 高频数据已在 main.py 的 _collect_highfreq_data 中收集
+        pass
     
     def compute_from_collected(self, streaming_data: StreamingData, **kwargs) -> List[KPIResult]:
         """
         从收集的数据计算舒适性KPI（流式模式）
         
-        特点：
-        - 纵向加速度来源：/viz/control/control.chassis_control.target_longitudinal_acceleration
-        - 低速过滤：速度 < min_valid_speed_kph 时不统计 jerk
-        - 速度相关阈值：根据当前速度动态选择阈值
+        Note:
+            数据来源优先级：
+            1. 高频数据 (control_highfreq ~100Hz) - 优先使用
+            2. 低频数据 (accelerations ~10Hz) - 兼容旧模式/缓存模式
         """
         self.clear_results()
         
-        if len(streaming_data.accelerations) < 10:
-            self._add_empty_results()
-            return self.get_results()
+        # 检查是否有高频控制数据可用
+        use_highfreq = len(streaming_data.control_highfreq) > 0 and len(streaming_data.control_auto_states) > 0
         
-        # 解构数据: (lon_acc, speed, timestamp)
-        data_records = streaming_data.accelerations
-        all_timestamps = np.array([r[2] for r in data_records])
-        all_lon_acc = np.array([r[0] for r in data_records])
-        all_speeds = np.array([r[1] if r[1] is not None else 0.0 for r in data_records])
+        if use_highfreq:
+            # 高频控制数据: (lon_acc, timestamp)
+            auto_indices = [i for i, (is_auto, _) in enumerate(streaming_data.control_auto_states) 
+                           if is_auto and i < len(streaming_data.control_highfreq)]
+            
+            if len(auto_indices) >= 10:
+                all_lon_acc = np.array([streaming_data.control_highfreq[i][0] for i in auto_indices])
+                all_timestamps = np.array([streaming_data.control_highfreq[i][1] for i in auto_indices])
+                
+                # 从底盘高频数据获取速度（插值对齐）
+                if len(streaming_data.chassis_highfreq) > 0:
+                    chassis_ts = np.array([d[4] for d in streaming_data.chassis_highfreq])
+                    chassis_speeds = np.array([d[2] for d in streaming_data.chassis_highfreq])
+                    all_speeds = np.interp(all_timestamps, chassis_ts, chassis_speeds)
+                else:
+                    # 回退到低频数据
+                    if len(streaming_data.accelerations) > 0:
+                        accel_ts = np.array([r[2] for r in streaming_data.accelerations])
+                        accel_speeds = np.array([r[1] if r[1] is not None else 0.0 for r in streaming_data.accelerations])
+                        all_speeds = np.interp(all_timestamps, accel_ts, accel_speeds)
+                    else:
+                        all_speeds = np.zeros_like(all_timestamps)
+            else:
+                use_highfreq = False
+        
+        if not use_highfreq:
+            # 回退到低频数据
+            if len(streaming_data.accelerations) < 10:
+                self._add_empty_results()
+                return self.get_results()
+            
+            # 解构数据: (lon_acc, speed, timestamp)
+            data_records = streaming_data.accelerations
+            all_timestamps = np.array([r[2] for r in data_records])
+            all_lon_acc = np.array([r[0] for r in data_records])
+            all_speeds = np.array([r[1] if r[1] is not None else 0.0 for r in data_records])
         
         # 低速过滤：只在 jerk 计算时使用高速数据
         high_speed_mask = all_speeds >= self.min_valid_speed_kph

@@ -122,7 +122,8 @@ class MileageKPI(BaseKPI):
             value=round(auto_time / 60, 2),
             unit="min",
             description="自动驾驶模式的持续时间",
-            merge_strategy=MergeStrategy.SUM
+            merge_strategy=MergeStrategy.SUM,
+            details={'time_s': auto_time}  # 精确秒数，供其他 KPI 使用
         ))
         
         self.add_result(KPIResult(
@@ -253,6 +254,14 @@ class MileageKPI(BaseKPI):
         Args:
             synced_frames: 同步后的帧列表
             streaming_data: 中间数据容器
+        
+        Note:
+            同步机制说明：
+            - 基准 topic: /function/function_manager (10Hz)
+            - 帧数量 = func 消息数量
+            - 定位数据: 每帧从 /localization/localization (~50Hz) 中找最近邻匹配
+            - 容差: 300ms 内匹配，否则 frame.valid=False 被跳过
+            - 里程计算帧率为 10Hz，对精度影响可忽略
         """
         for frame in synced_frames:
             if not frame.valid:

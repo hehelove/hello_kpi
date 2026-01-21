@@ -60,8 +60,13 @@ class TakeoverKPI(BaseKPI):
         
         接管：operator_type 从自动驾驶(True)变为非自动驾驶(False)
         有效接管：自动驾驶持续时间 >= min_auto_duration (默认 1s)
+        
+        Note:
+            - 跨 bag 间隔 (dt > 1s) 的状态变化不视为接管
+            - 接管前的自动驾驶时间会排除 bag 间隔
         """
         events = []
+        max_gap = 1.0  # 最大允许时间间隔（秒），超过则认为是 bag 间隔
         
         # 找到首次进入自动驾驶的时刻
         first_auto_idx = None
@@ -75,17 +80,39 @@ class TakeoverKPI(BaseKPI):
         
         # 从首次进入自动驾驶后开始检测
         auto_start_time = None
+        auto_duration_accumulated = 0.0  # 累计的有效自动驾驶时间
         
         for i in range(first_auto_idx, len(states)):
             is_auto = states[i]
             
-            if is_auto and auto_start_time is None:
-                # 进入自动驾驶
-                auto_start_time = timestamps[i]
+            # 计算与上一帧的时间间隔
+            dt = timestamps[i] - timestamps[i - 1] if i > first_auto_idx else 0
+            is_gap = dt > max_gap  # 是否为 bag 间隔
+            
+            if is_gap:
+                # 遇到 bag 间隔，重置状态
+                # 不将跨 bag 的状态变化视为接管
+                auto_start_time = None
+                auto_duration_accumulated = 0.0
+                if is_auto:
+                    # 新 bag 开始时是自动驾驶，记录开始时间
+                    auto_start_time = timestamps[i]
+                continue
+            
+            if is_auto:
+                if auto_start_time is None:
+                    # 进入自动驾驶
+                    auto_start_time = timestamps[i]
+                    auto_duration_accumulated = 0.0
+                else:
+                    # 持续自动驾驶，累加有效时间
+                    if 0 < dt <= max_gap:
+                        auto_duration_accumulated += dt
             
             elif not is_auto and auto_start_time is not None:
                 # 退出自动驾驶 (发生接管)
-                duration = timestamps[i] - auto_start_time
+                # 使用累计的有效自动驾驶时间，而非简单的时间差
+                duration = auto_duration_accumulated
                 
                 # 判断是否为有效接管
                 is_valid = duration >= self.min_auto_duration
@@ -97,6 +124,7 @@ class TakeoverKPI(BaseKPI):
                 ))
                 
                 auto_start_time = None
+                auto_duration_accumulated = 0.0
         
         return events
     
@@ -188,11 +216,13 @@ class TakeoverKPI(BaseKPI):
         total_valid_takeovers = len(valid_events)
         total_all_takeovers = len(takeover_events)
         
-        # 计算自动驾驶总时间
-        auto_time = self._compute_auto_time(states, timestamps)
-        
-        # 获取自动驾驶里程（从 kwargs 或通过 streaming_data 计算）
+        # 获取自动驾驶里程和时间（从里程统计 KPI 传入，确保一致性）
         auto_mileage_km = kwargs.get('auto_mileage_km', 0)
+        # 优先使用里程统计传入的时间（与里程统计保持一致）
+        auto_time = kwargs.get('auto_time_s', None)
+        if auto_time is None:
+            # 如果没有传入，使用本地计算（兼容旧逻辑）
+            auto_time = self._compute_auto_time(states, timestamps)
         
         # 获取 bag 时间映射器
         bag_mapper = BagTimeMapper(streaming_data.bag_infos)
@@ -201,12 +231,19 @@ class TakeoverKPI(BaseKPI):
         takeover_per_100km = (total_valid_takeovers / auto_mileage_km * 100) if auto_mileage_km > 0 else 0
         avg_takeover_mileage = (auto_mileage_km / total_valid_takeovers) if total_valid_takeovers > 0 else float('inf')
         
-        # 计算平均接管间隔
+        # 计算平均接管间隔（排除跨 bag 间隔的情况）
+        max_gap = 60.0  # 合理的最大接管间隔（1分钟），超过则认为是 bag 间隔
         if len(valid_events) > 1:
             intervals = []
             for i in range(1, len(valid_events)):
-                intervals.append(valid_events[i].timestamp - valid_events[i-1].timestamp)
-            avg_interval = np.mean(intervals)
+                interval = valid_events[i].timestamp - valid_events[i-1].timestamp
+                # 过滤异常大的间隔（可能是 bag 间隔）
+                # 同时检查两次接管是否在同一个 bag 中
+                same_bag = bag_mapper.get_bag_name(valid_events[i].timestamp) == \
+                           bag_mapper.get_bag_name(valid_events[i-1].timestamp)
+                if same_bag or interval <= max_gap:
+                    intervals.append(interval)
+            avg_interval = np.mean(intervals) if intervals else auto_time
         else:
             avg_interval = auto_time if total_valid_takeovers <= 1 else 0
         
@@ -255,13 +292,6 @@ class TakeoverKPI(BaseKPI):
             value=round(avg_interval / 60, 2),
             unit="min",
             description="两次接管之间的平均时间间隔"
-        ))
-        
-        self.add_result(KPIResult(
-            name="自动驾驶总时间",
-            value=round(auto_time / 60, 2),
-            unit="min",
-            description="自动驾驶模式的累计时间"
         ))
         
         return self.get_results()

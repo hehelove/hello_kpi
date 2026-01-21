@@ -20,12 +20,16 @@ class Topics:
     
     # 规划
     PLANNING_TRAJECTORY = "/planning/trajectory"
+    PLANNING_DEBUG = "/planning/debug"
     
     # 感知
     PERCEPTION_OBSTACLES = "/perception/fusion/obstacle_list_utm"
     
     # 底盘
     CHASSIS_DOMAIN = "/vehicle_io/chassis_domain"
+    
+    # 地图
+    MAP = "/map/map"
 
 
 class KPINames:
@@ -183,6 +187,7 @@ class PathPoint:
 class TrajectoryMsg(LightMessage):
     """轨迹消息 - 轻量版"""
     path_point: List[PathPoint] = field(default_factory=list)
+    lane_id: List[str] = field(default_factory=list)  # 用于场景检测
     _topic: str = field(default=Topics.PLANNING_TRAJECTORY, init=False)
 
 
@@ -234,6 +239,29 @@ class ControlDebugMsg(LightMessage):
 
 
 @dataclass
+class PlanningDebugMsg(LightMessage):
+    """Planning 调试消息 - 轻量版（保留原始 proto 数据）"""
+    data: bytes = field(default=b'')  # 原始 proto 数据
+    _topic: str = field(default=Topics.PLANNING_DEBUG, init=False)
+
+
+@dataclass
+class MapLane:
+    """地图车道信息（用于场景检测）"""
+    id: str = ""
+    turn: int = 1  # 1=直行, 2=左转, 3=右转, 4=掉头
+    junction_id: Optional[str] = None
+    lane_type: int = 0
+
+
+@dataclass
+class MapMsg(LightMessage):
+    """地图消息 - 轻量版（只保存场景检测需要的 lanes 信息）"""
+    lanes: List[MapLane] = field(default_factory=list)
+    _topic: str = field(default=Topics.MAP, init=False)
+
+
+@dataclass
 class ChassisControl:
     """底盘控制数据"""
     target_longitudinal_acceleration: Optional[float] = None
@@ -269,7 +297,8 @@ TOPIC_REQUIRED_FIELDS: Dict[str, List[str]] = {
         "motion_system.steering_wheel_speed"
     ],
     Topics.PLANNING_TRAJECTORY: [
-        "path_point"  # 数组字段，需要特殊处理
+        "path_point",  # 数组字段，需要特殊处理
+        "lane_id"  # 用于场景检测
     ],
     Topics.CONTROL_DEBUG: [
         "reserved0"  # Proto 原始数据
@@ -279,6 +308,12 @@ TOPIC_REQUIRED_FIELDS: Dict[str, List[str]] = {
     ],
     Topics.CONTROL: [
         "chassis_control.target_longitudinal_acceleration"
+    ],
+    Topics.PLANNING_DEBUG: [
+        "data"  # 原始 Proto 数据
+    ],
+    Topics.MAP: [
+        "lanes"  # 车道信息（用于场景检测）
     ]
 }
 
@@ -346,7 +381,10 @@ def extract_light_message(topic: str, msg: Any) -> Optional[LightMessage]:
                     y=MessageAccessor.get_field(pt, "y", None),
                     kappa=MessageAccessor.get_field(pt, "kappa", None)
                 ))
-            return TrajectoryMsg(path_point=path_points)
+            # 提取 lane_id 用于场景检测
+            raw_lane_ids = MessageAccessor.get_field(msg, "lane_id", [])
+            lane_ids = [str(lid) for lid in raw_lane_ids] if raw_lane_ids else []
+            return TrajectoryMsg(path_point=path_points, lane_id=lane_ids)
         
         elif topic == Topics.PERCEPTION_OBSTACLES:
             raw_obstacles = MessageAccessor.get_field(msg, "obstacles", [])
@@ -389,6 +427,23 @@ def extract_light_message(topic: str, msg: Any) -> Optional[LightMessage]:
                         msg, "chassis_control.target_longitudinal_acceleration", None)
                 )
             )
+        
+        elif topic == Topics.PLANNING_DEBUG:
+            return PlanningDebugMsg(
+                data=MessageAccessor.get_field(msg, "data", b'')
+            )
+        
+        elif topic == Topics.MAP:
+            raw_lanes = MessageAccessor.get_field(msg, "lanes", [])
+            lanes = []
+            for lane in raw_lanes:
+                lanes.append(MapLane(
+                    id=str(MessageAccessor.get_field(lane, "id", "")),
+                    turn=MessageAccessor.get_field(lane, "turn", 1),
+                    junction_id=MessageAccessor.get_field(lane, "junction_id", None) or None,
+                    lane_type=MessageAccessor.get_field(lane, "type", 0)
+                ))
+            return MapMsg(lanes=lanes)
         
         else:
             # 未知 topic，返回 None（保留原消息）

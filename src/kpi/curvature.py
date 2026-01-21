@@ -63,8 +63,12 @@ class CurvatureKPI(BaseKPI):
         # 曲率相关配置
         curvature_config = self.config.get('kpi', {}).get('curvature', {})
         self.max_distance_threshold = curvature_config.get('max_distance_threshold', 5.0)  # 最大匹配距离阈值(m)
-        self.curvature_threshold = self.config.get('kpi', {}).get(
-            'road_type', {}).get('curvature_threshold', 0.002)  # 直道/弯道判断阈值
+        
+        road_type_config = self.config.get('kpi', {}).get('road_type', {})
+        # 直道/弯道判断阈值（曲率 = 1/半径）
+        self.curvature_threshold = road_type_config.get('curvature_threshold', 0.003)  # 直道阈值：曲率<0.003 = 半径>333m
+        # 小弯道/大弯道判断阈值
+        self.large_curve_threshold = road_type_config.get('large_curve_threshold', 0.02)  # 大弯道阈值：曲率>=0.02 = 半径<50m
         
         # 初始化地理坐标转换器
         base_config = self.config.get('base', {})
@@ -108,7 +112,8 @@ class CurvatureKPI(BaseKPI):
                 matched_pairs=matched_pairs,
                 output_path=output_path,
                 title="Refline 匹配点可视化 (自车位置 vs 最近点)",
-                curvature_threshold=self.curvature_threshold
+                curvature_threshold=self.curvature_threshold,
+                large_curve_threshold=self.large_curve_threshold
             )
             
         except Exception as e:
@@ -350,6 +355,18 @@ class CurvatureKPI(BaseKPI):
             description="数据不足"
         ))
         self.add_result(KPIResult(
+            name="小弯道比例",
+            value=0.0,
+            unit="%",
+            description="数据不足"
+        ))
+        self.add_result(KPIResult(
+            name="大弯道比例",
+            value=0.0,
+            unit="%",
+            description="数据不足"
+        ))
+        self.add_result(KPIResult(
             name="轨迹匹配平均距离",
             value=0.0,
             unit="m",
@@ -454,11 +471,19 @@ class CurvatureKPI(BaseKPI):
         min_kappa = float(np.min(all_kappas))
         median_kappa = float(np.median(all_kappas))
         
-        # 统计直道/弯道比例
+        # 统计直道/弯道比例（区分小弯道和大弯道）
+        # 直道：曲率 < 0.003（半径 > 333m）
+        # 小弯道（正常弯道）：0.003 <= 曲率 < 0.02（半径 50m ~ 333m）
+        # 大弯道（路口转弯）：曲率 >= 0.02（半径 < 50m）
         straight_count = np.sum(all_kappas < self.curvature_threshold)
-        curve_count = np.sum(all_kappas >= self.curvature_threshold)
+        small_curve_count = np.sum((all_kappas >= self.curvature_threshold) & (all_kappas < self.large_curve_threshold))
+        large_curve_count = np.sum(all_kappas >= self.large_curve_threshold)
+        curve_count = small_curve_count + large_curve_count
+        
         straight_ratio = straight_count / valid_frame_count * 100
         curve_ratio = curve_count / valid_frame_count * 100
+        small_curve_ratio = small_curve_count / valid_frame_count * 100
+        large_curve_ratio = large_curve_count / valid_frame_count * 100
         
         # 统计距离
         mean_distance = float(np.mean(distances))
@@ -495,10 +520,36 @@ class CurvatureKPI(BaseKPI):
             name="弯道比例",
             value=round(curve_ratio, 2),
             unit="%",
-            description=f"曲率>={self.curvature_threshold}的路段占比",
+            description=f"曲率>={self.curvature_threshold}的路段占比（含小弯道和大弯道）",
             details={
                 'curve_frames': int(curve_count),
+                'small_curve_frames': int(small_curve_count),
+                'large_curve_frames': int(large_curve_count),
                 'total_frames': valid_frame_count
+            }
+        ))
+        
+        self.add_result(KPIResult(
+            name="小弯道比例",
+            value=round(small_curve_ratio, 2),
+            unit="%",
+            description=f"正常弯道：{self.curvature_threshold}<=曲率<{self.large_curve_threshold}（半径50m~333m）",
+            details={
+                'small_curve_frames': int(small_curve_count),
+                'curvature_range': f'{self.curvature_threshold}~{self.large_curve_threshold}',
+                'radius_range': '50m~333m'
+            }
+        ))
+        
+        self.add_result(KPIResult(
+            name="大弯道比例",
+            value=round(large_curve_ratio, 2),
+            unit="%",
+            description=f"路口转弯：曲率>={self.large_curve_threshold}（半径<50m）",
+            details={
+                'large_curve_frames': int(large_curve_count),
+                'curvature_threshold': self.large_curve_threshold,
+                'radius_threshold': '<50m'
             }
         ))
         

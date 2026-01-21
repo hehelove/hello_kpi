@@ -3,8 +3,9 @@
 包括急减速、横向猛打、顿挫检测
 """
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
+from scipy import signal
 
 from .base_kpi import BaseKPI, KPIResult, BagTimeMapper, StreamingData
 from ..data_loader.bag_reader import MessageAccessor
@@ -19,6 +20,8 @@ class EmergencyEvent:
     end_time: float
     peak_value: float
     speed_at_event: float = 0.0
+    # 事件窗口内的连续帧数据 [(relative_time_ms, value), ...]
+    series: List[tuple] = field(default_factory=list)
 
 
 class EmergencyEventsKPI(BaseKPI):
@@ -56,12 +59,19 @@ class EmergencyEventsKPI(BaseKPI):
         # 顿挫配置（使用速度相关阈值）
         jerk_config = self.config.get('kpi', {}).get('jerk_event', {})
         self.jerk_min_duration = jerk_config.get('min_duration', 0.2)
+        # 事件合并间隔：两个事件间隔小于此值则合并为一个
+        # 原因：车辆颠簸通常是"负向冲击→过渡→正向反弹"的模式，人体感知为同一次颠簸
+        self.jerk_merge_gap = jerk_config.get('merge_gap', 0.4)
         
         # 加载舒适性配置（用于获取速度相关阈值）
         self.comfort_config = self.config.get('kpi', {}).get('comfort', {})
         
         # 转向配置（横向猛打阈值）
         steering_config = self.config.get('kpi', {}).get('steering', {})
+        # 最小持续时间，过滤短暂噪声（50Hz下100ms=5帧）
+        self.lateral_min_duration = steering_config.get('min_duration', 0.1)
+        # 事件合并间隔，相邻事件间隔小于此值则合并
+        self.lateral_merge_gap = steering_config.get('merge_gap', 0.3)
         # 转角速度阈值 (°/s)，按速度分段
         self.lateral_speed_thresholds = steering_config.get('speed_thresholds', {
             0: 200, 10: 180, 20: 160, 30: 140, 40: 120,
@@ -72,6 +82,12 @@ class EmergencyEventsKPI(BaseKPI):
             100: 120, 80: 150, 60: 200, 30: 250, 10: 400, 0: 600
         })
         
+        # 滤波配置（与 weaving.py / steering.py 保持一致）
+        # 转角滤波截止频率 (Hz) - 保留 0~10Hz 有效信号
+        self.angle_filter_cutoff = steering_config.get('angle_filter_cutoff', 10.0)
+        # 转角速度滤波截止频率 (Hz) - 保留 0~15Hz 有效信号
+        self.rate_filter_cutoff = steering_config.get('rate_filter_cutoff', 15.0)
+        
         # 定位可信度配置
         loc_config = self.config.get('kpi', {}).get('localization', {})
         self.loc_valid_status = [3, 7]  # 有效的定位状态
@@ -80,6 +96,31 @@ class EmergencyEventsKPI(BaseKPI):
     def compute(self, synced_frames: List, **kwargs) -> List[KPIResult]:
         """计算紧急事件检测KPI - 通过流式模式复用逻辑"""
         return self._compute_via_streaming(synced_frames, **kwargs)
+    
+    def _apply_lowpass_filter(self, data: np.ndarray, cutoff_hz: float, fs: float, order: int = 2) -> np.ndarray:
+        """
+        应用 Butterworth 低通滤波
+        
+        Args:
+            data: 输入信号
+            cutoff_hz: 截止频率 (Hz)
+            fs: 采样率 (Hz)
+            order: 滤波器阶数
+            
+        Returns:
+            滤波后的信号
+        """
+        if len(data) < 3:
+            return data
+        
+        nyquist = fs / 2.0
+        normal_cutoff = cutoff_hz / nyquist
+        if normal_cutoff >= 1.0:
+            return data
+        
+        b, a = signal.butter(order, normal_cutoff, btype='low', analog=False)
+        filtered = signal.filtfilt(b, a, data)
+        return filtered
     
     def _get_deceleration_threshold(self, speed_kph: float) -> float:
         """根据速度获取减速度阈值（fail级别）"""
@@ -101,8 +142,14 @@ class EmergencyEventsKPI(BaseKPI):
         检测急减速事件（使用速度相关阈值）
         
         对每个数据点根据实时速度判断是否超过 fail 阈值
+        
+        注意：时间戳可能因为自动驾驶状态过滤而不连续（接管段被过滤）。
+        当相邻时间戳差距超过 max_gap 时，强制结束当前事件。
         """
         events = []
+        
+        # 时间跳跃阈值：超过此值认为是不同的时间段
+        max_gap = 0.5  # 0.5 秒
         
         # 逐点判断是否超过速度相关阈值
         over_threshold_mask = np.zeros(len(accelerations), dtype=bool)
@@ -114,11 +161,30 @@ class EmergencyEventsKPI(BaseKPI):
             if acc < threshold:  # 减速度为负值，小于阈值表示更急
                 over_threshold_mask[i] = True
         
-        # 检测连续超阈值事件
+        # 检测连续超阈值事件（考虑时间跳跃）
         in_event = False
         event_start_idx = None
         
         for i in range(len(over_threshold_mask)):
+            # 检查时间跳跃：如果与上一个时间点间隔过大，强制结束当前事件
+            if i > 0 and (timestamps[i] - timestamps[i-1]) > max_gap:
+                if in_event:
+                    # 强制结束事件（不跨越时间跳跃）
+                    in_event = False
+                    duration = timestamps[i-1] - timestamps[event_start_idx]
+                    if duration >= self.hard_braking_min_duration:
+                        event_mask = (timestamps >= timestamps[event_start_idx]) & (timestamps <= timestamps[i-1])
+                        speed_at_event = np.mean(speeds[event_mask]) if np.any(event_mask) else 0.0
+                        peak_value = np.min(accelerations[event_mask]) if np.any(event_mask) else accelerations[event_start_idx]
+                        
+                        events.append(EmergencyEvent(
+                            event_type='hard_braking',
+                            start_time=timestamps[event_start_idx],
+                            end_time=timestamps[i-1],
+                            peak_value=peak_value,
+                            speed_at_event=speed_at_event
+                        ))
+            
             if over_threshold_mask[i] and not in_event:
                 in_event = True
                 event_start_idx = i
@@ -179,8 +245,14 @@ class EmergencyEventsKPI(BaseKPI):
         检测顿挫事件（使用速度相关阈值）
         
         对每个 jerk 点根据实时速度判断是否超过 peak 阈值
+        
+        注意：时间戳可能因为自动驾驶状态过滤而不连续（接管段被过滤）。
+        当相邻时间戳差距超过 max_gap 时，强制结束当前事件。
         """
         events = []
+        
+        # 时间跳跃阈值：超过此值认为是不同的时间段
+        max_gap = 0.5  # 0.5 秒
         
         # 计算jerk
         ts_jerk, jerks = SignalProcessor.compute_jerk(timestamps, accelerations)
@@ -203,11 +275,35 @@ class EmergencyEventsKPI(BaseKPI):
             if abs(jerk_val) > threshold:
                 over_threshold_mask[i] = True
         
-        # 检测连续超阈值事件
+        # 检测连续超阈值事件（考虑时间跳跃）
         in_event = False
         event_start_idx = None
         
         for i in range(len(over_threshold_mask)):
+            # 检查时间跳跃：如果与上一个时间点间隔过大，强制结束当前事件
+            if i > 0 and (ts_jerk[i] - ts_jerk[i-1]) > max_gap:
+                if in_event:
+                    # 强制结束事件（不跨越时间跳跃）
+                    in_event = False
+                    duration = ts_jerk[i-1] - ts_jerk[event_start_idx]
+                    if duration >= self.jerk_min_duration:
+                        event_mask = (ts_jerk >= ts_jerk[event_start_idx]) & (ts_jerk <= ts_jerk[i-1])
+                        peak_value = np.max(np.abs(jerks[event_mask])) if np.any(event_mask) else abs(jerks[event_start_idx])
+                        
+                        event_series = []
+                        event_start = ts_jerk[event_start_idx]
+                        for idx in range(event_start_idx, i):
+                            rel_time_ms = (ts_jerk[idx] - event_start) * 1000
+                            event_series.append((round(rel_time_ms, 1), round(jerks[idx], 2)))
+                        
+                        events.append(EmergencyEvent(
+                            event_type='jerk_event',
+                            start_time=ts_jerk[event_start_idx],
+                            end_time=ts_jerk[i-1],
+                            peak_value=peak_value,
+                            series=event_series
+                        ))
+            
             if over_threshold_mask[i] and not in_event:
                 in_event = True
                 event_start_idx = i
@@ -216,15 +312,23 @@ class EmergencyEventsKPI(BaseKPI):
                 # 检查持续时间
                 duration = ts_jerk[i-1] - ts_jerk[event_start_idx]
                 if duration >= self.jerk_min_duration:
-                    # 计算峰值
+                    # 计算峰值和序列
                     event_mask = (ts_jerk >= ts_jerk[event_start_idx]) & (ts_jerk <= ts_jerk[i-1])
                     peak_value = np.max(np.abs(jerks[event_mask])) if np.any(event_mask) else abs(jerks[event_start_idx])
+                    
+                    # 保存事件窗口内的 jerk 序列 [(relative_time_ms, jerk_value), ...]
+                    event_series = []
+                    event_start = ts_jerk[event_start_idx]
+                    for idx in range(event_start_idx, i):
+                        rel_time_ms = (ts_jerk[idx] - event_start) * 1000
+                        event_series.append((round(rel_time_ms, 1), round(jerks[idx], 2)))
                     
                     events.append(EmergencyEvent(
                         event_type='jerk_event',
                         start_time=ts_jerk[event_start_idx],
                         end_time=ts_jerk[i-1],
-                        peak_value=peak_value
+                        peak_value=peak_value,
+                        series=event_series
                     ))
         
         # 处理最后一个事件
@@ -234,14 +338,57 @@ class EmergencyEventsKPI(BaseKPI):
                 event_mask = (ts_jerk >= ts_jerk[event_start_idx])
                 peak_value = np.max(np.abs(jerks[event_mask])) if np.any(event_mask) else abs(jerks[event_start_idx])
                 
+                # 保存事件窗口内的 jerk 序列
+                event_series = []
+                event_start = ts_jerk[event_start_idx]
+                for idx in range(event_start_idx, len(ts_jerk)):
+                    rel_time_ms = (ts_jerk[idx] - event_start) * 1000
+                    event_series.append((round(rel_time_ms, 1), round(jerks[idx], 2)))
+                
                 events.append(EmergencyEvent(
                     event_type='jerk_event',
                     start_time=ts_jerk[event_start_idx],
                     end_time=ts_jerk[-1],
-                    peak_value=peak_value
+                    peak_value=peak_value,
+                    series=event_series
                 ))
         
-        return events
+        # 合并间隔小于 merge_gap 的相邻事件
+        # 原因：车辆颠簸通常是"负向冲击→短暂过渡→正向反弹"的模式
+        # 间隔小于 400ms 时人体通常感知为同一次颠簸
+        if len(events) <= 1 or self.jerk_merge_gap <= 0:
+            return events
+        
+        merged_events = []
+        current = events[0]
+        
+        for next_event in events[1:]:
+            gap = next_event.start_time - current.end_time
+            
+            if gap <= self.jerk_merge_gap:
+                # 合并事件：扩展时间范围，更新峰值，合并序列
+                # 合并 series（调整第二个事件的相对时间）
+                merged_series = list(current.series)
+                time_offset = (next_event.start_time - current.start_time) * 1000
+                for rel_t, val in next_event.series:
+                    merged_series.append((round(rel_t + time_offset, 1), val))
+                
+                current = EmergencyEvent(
+                    event_type='jerk_event',
+                    start_time=current.start_time,
+                    end_time=next_event.end_time,
+                    peak_value=max(current.peak_value, next_event.peak_value),
+                    series=merged_series
+                )
+            else:
+                # 间隔超过阈值，保存当前事件，开始新事件
+                merged_events.append(current)
+                current = next_event
+        
+        # 添加最后一个事件
+        merged_events.append(current)
+        
+        return merged_events
     
     def _detect_lateral_jerk(self,
                               timestamps: np.ndarray,
@@ -250,44 +397,69 @@ class EmergencyEventsKPI(BaseKPI):
         """
         检测横向猛打事件
         同时检测：转角速度超限 + 转角加速度超限
+        
+        注意：时间戳可能因为自动驾驶状态过滤而不连续（接管段被过滤）。
+        当相邻时间戳差距超过 max_gap 时，强制结束当前事件，避免跨越接管段。
         """
         events = []
         
         if len(steering_velocities) == 0:
             return events
         
+        # 时间跳跃阈值：超过此值认为是不同的时间段（接管或bag切换）
+        max_gap = 0.5  # 0.5 秒
+        
         # ========== 1. 转角速度超限检测 ==========
         vel_thresholds = np.array([self._get_lateral_threshold(s) for s in speeds])
         vel_over_threshold = np.abs(steering_velocities) > vel_thresholds
         
-        # 找连续区间
+        # 找连续区间（考虑时间跳跃）
         in_event = False
         event_start_idx = 0
         
         for i in range(len(vel_over_threshold)):
+            # 检查时间跳跃：如果与上一个时间点间隔过大，强制结束当前事件
+            if i > 0 and (timestamps[i] - timestamps[i-1]) > max_gap:
+                if in_event:
+                    # 强制结束事件（不跨越时间跳跃）
+                    in_event = False
+                    duration = timestamps[i - 1] - timestamps[event_start_idx]
+                    if duration >= self.lateral_min_duration:
+                        events.append(EmergencyEvent(
+                            event_type='lateral_jerk_vel',
+                            start_time=timestamps[event_start_idx],
+                            end_time=timestamps[i - 1],
+                            peak_value=float(np.max(np.abs(steering_velocities[event_start_idx:i]))),
+                            speed_at_event=float(np.mean(speeds[event_start_idx:i]))
+                        ))
+            
             if vel_over_threshold[i] and not in_event:
                 in_event = True
                 event_start_idx = i
             elif not vel_over_threshold[i] and in_event:
                 in_event = False
-                
-                events.append(EmergencyEvent(
-                    event_type='lateral_jerk_vel',  # 转角速度超限
-                    start_time=timestamps[event_start_idx],
-                    end_time=timestamps[i - 1],
-                    peak_value=float(np.max(np.abs(steering_velocities[event_start_idx:i]))),
-                    speed_at_event=float(np.mean(speeds[event_start_idx:i]))
-                ))
+                # 检查持续时间，过滤单帧噪声
+                duration = timestamps[i - 1] - timestamps[event_start_idx]
+                if duration >= self.lateral_min_duration:
+                    events.append(EmergencyEvent(
+                        event_type='lateral_jerk_vel',  # 转角速度超限
+                        start_time=timestamps[event_start_idx],
+                        end_time=timestamps[i - 1],
+                        peak_value=float(np.max(np.abs(steering_velocities[event_start_idx:i]))),
+                        speed_at_event=float(np.mean(speeds[event_start_idx:i]))
+                    ))
         
         # 检查是否在事件中结束
         if in_event:
-            events.append(EmergencyEvent(
-                event_type='lateral_jerk_vel',
-                start_time=timestamps[event_start_idx],
-                end_time=timestamps[-1],
-                peak_value=float(np.max(np.abs(steering_velocities[event_start_idx:]))),
-                speed_at_event=float(np.mean(speeds[event_start_idx:]))
-            ))
+            duration = timestamps[-1] - timestamps[event_start_idx]
+            if duration >= self.lateral_min_duration:
+                events.append(EmergencyEvent(
+                    event_type='lateral_jerk_vel',
+                    start_time=timestamps[event_start_idx],
+                    end_time=timestamps[-1],
+                    peak_value=float(np.max(np.abs(steering_velocities[event_start_idx:]))),
+                    speed_at_event=float(np.mean(speeds[event_start_idx:]))
+                ))
         
         # ========== 2. 转角加速度超限检测 ==========
         ts_acc, steering_acc = SignalProcessor.compute_derivative(timestamps, steering_velocities)
@@ -302,33 +474,87 @@ class EmergencyEventsKPI(BaseKPI):
             event_start_idx = 0
             
             for i in range(len(acc_over_threshold)):
+                # 检查时间跳跃
+                if i > 0 and (ts_acc[i] - ts_acc[i-1]) > max_gap:
+                    if in_event:
+                        in_event = False
+                        duration = ts_acc[i - 1] - ts_acc[event_start_idx]
+                        if duration >= self.lateral_min_duration:
+                            events.append(EmergencyEvent(
+                                event_type='lateral_jerk_acc',
+                                start_time=ts_acc[event_start_idx],
+                                end_time=ts_acc[i - 1],
+                                peak_value=float(np.max(np.abs(steering_acc[event_start_idx:i]))),
+                                speed_at_event=float(np.mean(speeds_at_acc[event_start_idx:i]))
+                            ))
+                
                 if acc_over_threshold[i] and not in_event:
                     in_event = True
                     event_start_idx = i
                 elif not acc_over_threshold[i] and in_event:
                     in_event = False
-                    
-                    events.append(EmergencyEvent(
-                        event_type='lateral_jerk_acc',  # 转角加速度超限
-                        start_time=ts_acc[event_start_idx],
-                        end_time=ts_acc[i - 1],
-                        peak_value=float(np.max(np.abs(steering_acc[event_start_idx:i]))),
-                        speed_at_event=float(np.mean(speeds_at_acc[event_start_idx:i]))
-                    ))
+                    # 检查持续时间，过滤单帧噪声
+                    duration = ts_acc[i - 1] - ts_acc[event_start_idx]
+                    if duration >= self.lateral_min_duration:
+                        events.append(EmergencyEvent(
+                            event_type='lateral_jerk_acc',  # 转角加速度超限
+                            start_time=ts_acc[event_start_idx],
+                            end_time=ts_acc[i - 1],
+                            peak_value=float(np.max(np.abs(steering_acc[event_start_idx:i]))),
+                            speed_at_event=float(np.mean(speeds_at_acc[event_start_idx:i]))
+                        ))
             
             if in_event:
-                events.append(EmergencyEvent(
-                    event_type='lateral_jerk_acc',
-                    start_time=ts_acc[event_start_idx],
-                    end_time=ts_acc[-1],
-                    peak_value=float(np.max(np.abs(steering_acc[event_start_idx:]))),
-                    speed_at_event=float(np.mean(speeds_at_acc[event_start_idx:]))
-                ))
+                duration = ts_acc[-1] - ts_acc[event_start_idx]
+                if duration >= self.lateral_min_duration:
+                    events.append(EmergencyEvent(
+                        event_type='lateral_jerk_acc',
+                        start_time=ts_acc[event_start_idx],
+                        end_time=ts_acc[-1],
+                        peak_value=float(np.max(np.abs(steering_acc[event_start_idx:]))),
+                        speed_at_event=float(np.mean(speeds_at_acc[event_start_idx:]))
+                    ))
         
         # 按时间排序
         events.sort(key=lambda e: e.start_time)
         
+        # 合并相邻事件
+        events = self._merge_lateral_jerk_events(events)
+        
         return events
+    
+    def _merge_lateral_jerk_events(self, events: List[EmergencyEvent]) -> List[EmergencyEvent]:
+        """
+        合并相邻的横向猛打事件
+        
+        当两个事件间隔小于 merge_gap 时，合并为一个事件。
+        这避免了一次大幅转向被拆分成多个短事件。
+        """
+        if len(events) <= 1:
+            return events
+        
+        merged = []
+        current = events[0]
+        
+        for i in range(1, len(events)):
+            next_event = events[i]
+            gap = next_event.start_time - current.end_time
+            
+            if gap <= self.lateral_merge_gap:
+                # 合并事件：取更大的峰值，平均速度，扩展时间范围
+                current = EmergencyEvent(
+                    event_type=current.event_type if current.event_type == next_event.event_type else 'lateral_jerk_both',
+                    start_time=current.start_time,
+                    end_time=next_event.end_time,
+                    peak_value=max(current.peak_value, next_event.peak_value),
+                    speed_at_event=(current.speed_at_event + next_event.speed_at_event) / 2
+                )
+            else:
+                merged.append(current)
+                current = next_event
+        
+        merged.append(current)
+        return merged
     
     def _get_lateral_threshold(self, speed_kmh: float) -> float:
         """根据速度获取转角速度阈值"""
@@ -338,7 +564,7 @@ class EmergencyEventsKPI(BaseKPI):
             if speed_kmh >= threshold_speed:
                 return self.lateral_speed_thresholds[threshold_speed]
         
-        return self.lateral_speed_thresholds.get(0, 150)
+        return self.lateral_speed_thresholds.get(0, 200)
     
     def _get_steering_acc_threshold(self, speed_kmh: float) -> float:
         """根据速度获取转角加速度阈值"""
@@ -382,88 +608,136 @@ class EmergencyEventsKPI(BaseKPI):
         """
         收集紧急事件相关数据（流式模式）
         
-        纵向加速度来源：/control/control.chassis_control.target_longitudinal_acceleration
+        Note:
+            此方法现在不再从 synced_frames 收集数据，
+            而是依赖 main.py 预先收集的高频数据:
+            - control_highfreq (~100Hz): 纵向加速度，用于急减速和顿挫检测
+            - chassis_highfreq (~50Hz): 转角速度，用于横向猛打检测
         """
-        for frame in synced_frames:
-            fm_msg = frame.messages.get("/function/function_manager")
-            chassis_msg = frame.messages.get("/vehicle/chassis_domain_report")
-            control_msg = frame.messages.get("/control/control")
-            loc_msg = frame.messages.get("/localization/localization")
-            
-            if fm_msg is None or chassis_msg is None:
-                continue
-            
-            operator_type = MessageAccessor.get_field(fm_msg, "operator_type")
-            is_auto = operator_type == self.auto_operator_type
-            
-            if not is_auto:
-                continue
-            
-            # 定位可信度检查
-            if loc_msg is not None:
-                loc_status = MessageAccessor.get_field(loc_msg, "status.common", None)
-                pos_stddev_east = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.east", None)
-                pos_stddev_north = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.north", None)
-                
-                if loc_status is not None and loc_status not in self.loc_valid_status:
-                    continue
-                
-                if pos_stddev_east is not None and pos_stddev_north is not None:
-                    if max(pos_stddev_east, pos_stddev_north) > self.loc_max_stddev:
-                        continue
-            
-            # 获取纵向加速度（优先使用 control topic）
-            lon_acc = None
-            if control_msg is not None:
-                lon_acc = MessageAccessor.get_field(
-                    control_msg, "chassis_control.target_longitudinal_acceleration", None)
-            
-            # 如果 control topic 没有数据，则跳过
-            if lon_acc is None:
-                continue
-            
-            # 获取其他数据（从 chassis）
-            steering_vel = MessageAccessor.get_field(
-                chassis_msg, "eps_system.actual_steering_angle_velocity", None)
-            speed = MessageAccessor.get_field(
-                chassis_msg, "motion_system.vehicle_speed", None)
-            
-            # 存储: (lon_acc, steering_vel, speed, timestamp)
-            streaming_data.emergency_data.append((
-                lon_acc,
-                steering_vel if steering_vel is not None else 0.0,
-                speed if speed is not None else 0.0,
-                frame.timestamp
-            ))
+        # 高频数据已在 main.py 的 _collect_highfreq_data 中收集
+        pass
     
     def compute_from_collected(self, streaming_data: StreamingData, **kwargs) -> List[KPIResult]:
         """
         从收集的数据计算紧急事件KPI（流式模式）
+        
+        Note:
+            数据来源优先级：
+            1. 高频数据 (control_highfreq ~100Hz, chassis_highfreq ~50Hz) - 优先使用
+            2. 低频数据 (emergency_data ~10Hz) - 兼容旧模式/缓存模式
         """
         self.clear_results()
         
-        if len(streaming_data.emergency_data) < 10:
-            self._add_empty_results()
-            return self.get_results()
+        # 检查是否有高频数据可用
+        use_control_highfreq = len(streaming_data.control_highfreq) > 0 and len(streaming_data.control_auto_states) > 0
+        use_chassis_highfreq = len(streaming_data.chassis_highfreq) > 0 and len(streaming_data.chassis_auto_states) > 0
         
-        # 解构数据
-        lon_accelerations = np.array([d[0] for d in streaming_data.emergency_data])
-        steering_velocities = np.array([d[1] for d in streaming_data.emergency_data])
-        speeds = np.array([d[2] for d in streaming_data.emergency_data])
-        timestamps = np.array([d[3] for d in streaming_data.emergency_data])
+        # ========== 纵向加速度数据（用于急减速和顿挫检测）==========
+        if use_control_highfreq:
+            # 高频控制数据: (lon_acc, timestamp)
+            auto_indices = [i for i, (is_auto, _) in enumerate(streaming_data.control_auto_states) 
+                           if is_auto and i < len(streaming_data.control_highfreq)]
+            
+            if len(auto_indices) >= 10:
+                lon_accelerations = np.array([streaming_data.control_highfreq[i][0] for i in auto_indices])
+                control_timestamps = np.array([streaming_data.control_highfreq[i][1] for i in auto_indices])
+                
+                # 从底盘高频数据获取速度（插值对齐）
+                if use_chassis_highfreq:
+                    chassis_ts = np.array([d[4] for d in streaming_data.chassis_highfreq])
+                    chassis_speeds = np.array([d[2] for d in streaming_data.chassis_highfreq])
+                    control_speeds = np.interp(control_timestamps, chassis_ts, chassis_speeds)
+                else:
+                    # 回退到低频数据
+                    if len(streaming_data.emergency_data) > 0:
+                        emerg_ts = np.array([d[3] for d in streaming_data.emergency_data])
+                        emerg_speeds = np.array([d[2] for d in streaming_data.emergency_data])
+                        control_speeds = np.interp(control_timestamps, emerg_ts, emerg_speeds)
+                    else:
+                        control_speeds = np.zeros_like(control_timestamps)
+            else:
+                # 高频数据不足，回退
+                use_control_highfreq = False
+        
+        if not use_control_highfreq:
+            # 回退到低频数据
+            if len(streaming_data.emergency_data) < 10:
+                self._add_empty_results()
+                return self.get_results()
+            
+            lon_accelerations = np.array([d[0] for d in streaming_data.emergency_data])
+            control_speeds = np.array([d[2] for d in streaming_data.emergency_data])
+            control_timestamps = np.array([d[3] for d in streaming_data.emergency_data])
+        
+        # ========== 转角速度数据（用于横向猛打检测）==========
+        # 不直接使用底盘的 steering_vel（原始信号噪声大），
+        # 而是从 steering_angle 差分计算，与低频模式保持一致
+        if use_chassis_highfreq:
+            # 高频底盘数据: (steering_angle, steering_vel, speed, lat_acc, timestamp)
+            auto_indices = [i for i, (is_auto, _) in enumerate(streaming_data.chassis_auto_states) 
+                           if is_auto and i < len(streaming_data.chassis_highfreq)]
+            
+            if len(auto_indices) >= 10:
+                # 提取转角、速度、时间戳
+                steering_angles = np.array([streaming_data.chassis_highfreq[i][0] for i in auto_indices])
+                chassis_speeds = np.array([streaming_data.chassis_highfreq[i][2] for i in auto_indices])
+                chassis_timestamps = np.array([streaming_data.chassis_highfreq[i][4] for i in auto_indices])
+                
+                # 估计实际采样率
+                if len(chassis_timestamps) >= 2:
+                    actual_fs = 1.0 / np.median(np.diff(chassis_timestamps))
+                    actual_fs = max(1.0, min(actual_fs, 100.0))
+                else:
+                    actual_fs = 50.0  # 默认 50Hz
+                
+                # 1. 对转角进行低通滤波（去噪）
+                angle_cutoff = min(self.angle_filter_cutoff, actual_fs / 2 - 0.1)
+                if angle_cutoff > 0:
+                    steering_angles_filtered = self._apply_lowpass_filter(
+                        steering_angles, angle_cutoff, actual_fs, order=2)
+                else:
+                    steering_angles_filtered = steering_angles
+                
+                # 2. 差分计算转角速度
+                ts_rate, steering_velocities = SignalProcessor.compute_derivative(
+                    chassis_timestamps, steering_angles_filtered)
+                
+                # 3. 对转角速度进行低通滤波
+                rate_cutoff = min(self.rate_filter_cutoff, actual_fs / 2 - 0.1)
+                if rate_cutoff > 0 and len(steering_velocities) >= 3:
+                    steering_velocities = self._apply_lowpass_filter(
+                        steering_velocities, rate_cutoff, actual_fs, order=2)
+                
+                # 4. 将速度插值到转角速度的时间戳
+                chassis_speeds = np.interp(ts_rate, chassis_timestamps, chassis_speeds)
+                chassis_timestamps = ts_rate
+            else:
+                use_chassis_highfreq = False
+        
+        if not use_chassis_highfreq:
+            # 回退到低频数据
+            if len(streaming_data.emergency_data) >= 10:
+                steering_velocities = np.array([d[1] for d in streaming_data.emergency_data])
+                chassis_speeds = np.array([d[2] for d in streaming_data.emergency_data])
+                chassis_timestamps = np.array([d[3] for d in streaming_data.emergency_data])
+            else:
+                steering_velocities = np.array([])
+                chassis_speeds = np.array([])
+                chassis_timestamps = np.array([])
         
         # 1. 检测急减速
         hard_braking_events = self._detect_hard_braking(
-            timestamps, lon_accelerations, speeds)
+            control_timestamps, lon_accelerations, control_speeds)
         
         # 2. 检测顿挫（需要速度信息）
-        jerk_events = self._detect_jerk_events(timestamps, lon_accelerations, speeds)
+        jerk_events = self._detect_jerk_events(control_timestamps, lon_accelerations, control_speeds)
         
         # 3. 检测横向猛打（转角速度超限 + 转角加速度超限）
-        lateral_jerk_events = self._detect_lateral_jerk(
-            timestamps, steering_velocities, speeds)
+        if len(steering_velocities) >= 10:
+            lateral_jerk_events = self._detect_lateral_jerk(
+                chassis_timestamps, steering_velocities, chassis_speeds)
+        else:
+            lateral_jerk_events = []
         
         bag_mapper = BagTimeMapper(streaming_data.bag_infos)
         
@@ -481,15 +755,16 @@ class EmergencyEventsKPI(BaseKPI):
                 'threshold_at_10kph': low_speed_thresh,
                 'threshold_at_60kph': high_speed_thresh,
                 'min_duration_ms': self.hard_braking_min_duration * 1000,
-                'sample_count': len(timestamps)
+                'sample_count': len(control_timestamps)
             }
         )
         for i, e in enumerate(hard_braking_events):
             threshold_used = abs(self._get_deceleration_threshold(e.speed_at_event))
+            duration_ms = (e.end_time - e.start_time) * 1000
             hard_braking_result.add_anomaly(
                 timestamp=e.start_time,
                 bag_name=bag_mapper.get_bag_name(e.start_time),
-                description=f"急减速 #{i+1}@{e.speed_at_event:.0f}km/h：{e.peak_value:.2f}<{threshold_used:.2f}m/s²",
+                description=f"急减速 #{i+1}@{e.speed_at_event:.0f}km/h：{e.peak_value:.2f}<{threshold_used:.2f}m/s²，持续{duration_ms:.0f}ms",
                 value=e.peak_value,
                 threshold=-threshold_used
             )
@@ -507,14 +782,22 @@ class EmergencyEventsKPI(BaseKPI):
         )
         for i, e in enumerate(jerk_events):
             # 估算事件时的速度（使用事件开始时间）
-            event_start_idx = np.argmin(np.abs(timestamps - e.start_time))
-            event_speed = speeds[event_start_idx] if event_start_idx < len(speeds) else 30.0
+            event_start_idx = np.argmin(np.abs(control_timestamps - e.start_time))
+            event_speed = control_speeds[event_start_idx] if event_start_idx < len(control_speeds) else 30.0
             threshold_used = self._get_jerk_threshold(event_speed)
+            duration_ms = (e.end_time - e.start_time) * 1000
+            
+            # 格式化 jerk 序列（只显示值，省略相对时间）
+            jerk_values = [v for _, v in e.series] if e.series else []
+            series_str = ",".join(f"{v:.1f}" for v in jerk_values[:20])  # 最多显示20个
+            if len(jerk_values) > 20:
+                series_str += f"...共{len(jerk_values)}帧"
+            
             jerk_result.add_anomaly(
                 timestamp=e.start_time,
                 bag_name=bag_mapper.get_bag_name(e.start_time),
-                description=f"顿挫 #{i+1}@{event_speed:.0f}km/h：|{e.peak_value:.2f}|>{threshold_used:.2f}m/s³",
-                value=e.peak_value,
+                description=f"顿挫 #{i+1}@{event_speed:.0f}km/h：|{e.peak_value:.2f}|>{threshold_used:.2f}m/s³，持续{duration_ms:.0f}ms，jerk序列[{series_str}]",
+                value={'peak': round(e.peak_value, 2), 'series': e.series},
                 threshold=threshold_used
             )
         self.add_result(jerk_result)
@@ -534,12 +817,13 @@ class EmergencyEventsKPI(BaseKPI):
             }
         )
         for i, e in enumerate(lateral_jerk_events):
+            duration_ms = (e.end_time - e.start_time) * 1000
             if e.event_type == 'lateral_jerk_vel':
                 threshold = self._get_lateral_threshold(e.speed_at_event)
                 lateral_result.add_anomaly(
                     timestamp=e.start_time,
                     bag_name=bag_mapper.get_bag_name(e.start_time),
-                    description=f"横向猛打 #{i+1}(转角速度)：{e.peak_value:.1f}°/s，车速 {e.speed_at_event:.1f}km/h",
+                    description=f"横向猛打 #{i+1}(转角速度)：{e.peak_value:.1f}°/s，车速 {e.speed_at_event:.1f}km/h，持续{duration_ms:.0f}ms",
                     value=e.peak_value,
                     threshold=threshold
                 )
@@ -548,7 +832,7 @@ class EmergencyEventsKPI(BaseKPI):
                 lateral_result.add_anomaly(
                     timestamp=e.start_time,
                     bag_name=bag_mapper.get_bag_name(e.start_time),
-                    description=f"横向猛打 #{i+1}(转角加速度)：{e.peak_value:.1f}°/s²，车速 {e.speed_at_event:.1f}km/h",
+                    description=f"横向猛打 #{i+1}(转角加速度)：{e.peak_value:.1f}°/s²，车速 {e.speed_at_event:.1f}km/h，持续{duration_ms:.0f}ms",
                     value=e.peak_value,
                     threshold=threshold
                 )

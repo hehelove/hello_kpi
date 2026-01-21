@@ -48,14 +48,17 @@ class SteeringSmoothnessKPI(BaseKPI):
         # 基本参数
         self.sampling_rate_hz = smoothness_config.get('sampling_rate_hz', 50)
         self.min_speed_kmh = smoothness_config.get('valid_condition', {}).get('min_speed_kmh', 1.0)
+        # 异常事件报告的最低速度（低于此速度的异常不报告）
+        self.min_anomaly_speed_kmh = smoothness_config.get('valid_condition', {}).get('min_anomaly_speed_kmh', 10.0)
         
-        # 预处理配置
+        # 预处理配置（滤波截止频率）
         preprocess_config = smoothness_config.get('preprocessing', {})
         angle_config = preprocess_config.get('steering_angle', {})
         rate_config = preprocess_config.get('steering_angle_rate', {})
         
-        self.angle_filter_cutoff = angle_config.get('lowpass_filter', {}).get('cutoff_hz', 3.0)
-        self.rate_filter_cutoff = rate_config.get('lowpass_filter', {}).get('cutoff_hz', 5.0)
+        # 默认截止频率：10Hz/15Hz（保留更多有效信号，同时滤除高频噪声）
+        self.angle_filter_cutoff = angle_config.get('lowpass_filter', {}).get('cutoff_hz', 10.0)
+        self.rate_filter_cutoff = rate_config.get('lowpass_filter', {}).get('cutoff_hz', 15.0)
         
         # 滑动窗口配置
         window_config = smoothness_config.get('window', {})
@@ -108,13 +111,19 @@ class SteeringSmoothnessKPI(BaseKPI):
         return 0.0
     
     def _compute_sliding_window_rms(self, values: np.ndarray, timestamps: np.ndarray, 
-                                     window_duration: float, step: float) -> tuple:
-        """计算滑动窗口 RMS"""
+                                     window_duration: float, step: float,
+                                     fs: float = None) -> tuple:
+        """计算滑动窗口 RMS
+        
+        Args:
+            fs: 实际采样率(Hz)，若为 None 则使用配置值
+        """
         if len(values) == 0:
             return np.array([]), np.array([])
         
-        window_size = int(window_duration * self.sampling_rate_hz)
-        step_size = int(step * self.sampling_rate_hz)
+        actual_fs = fs if fs is not None else self.sampling_rate_hz
+        window_size = int(window_duration * actual_fs)
+        step_size = int(step * actual_fs)
         
         rms_values = []
         window_centers = []
@@ -172,76 +181,78 @@ class SteeringSmoothnessKPI(BaseKPI):
     def collect(self, synced_frames: List, streaming_data: StreamingData, **kwargs):
         """
         收集转向数据（流式模式）
+        
+        Note:
+            此方法现在不再从 synced_frames 收集数据，
+            而是依赖 main.py 预先收集的高频数据 (chassis_highfreq)。
+            保留此方法是为了兼容性，实际数据收集在 main.py 中完成。
         """
-        for frame in synced_frames:
-            fm_msg = frame.messages.get("/function/function_manager")
-            chassis_msg = frame.messages.get("/vehicle/chassis_domain_report")
-            loc_msg = frame.messages.get("/localization/localization")
-            
-            if fm_msg is None or chassis_msg is None:
-                continue
-            
-            operator_type = MessageAccessor.get_field(fm_msg, "operator_type")
-            is_auto = operator_type == self.auto_operator_type
-            
-            if not is_auto:
-                continue
-            
-            # 定位可信度检查
-            if loc_msg is not None:
-                loc_status = MessageAccessor.get_field(loc_msg, "status.common", None)
-                pos_stddev_east = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.east", None)
-                pos_stddev_north = MessageAccessor.get_field(
-                    loc_msg, "global_localization.position_stddev.north", None)
-                
-                if loc_status is not None and loc_status not in self.loc_valid_status:
-                    continue
-                
-                if pos_stddev_east is not None and pos_stddev_north is not None:
-                    if max(pos_stddev_east, pos_stddev_north) > self.loc_max_stddev:
-                        continue
-            
-            # 获取转向数据
-            steering_angle = MessageAccessor.get_field(
-                chassis_msg, "eps_system.actual_steering_angle", None)
-            speed = MessageAccessor.get_field(
-                chassis_msg, "motion_system.vehicle_speed", None)
-            
-            if steering_angle is None or speed is None:
-                continue
-            
-            # 速度过滤
-            if speed < self.min_speed_kmh:
-                continue
-            
-            # 存储: (steering_angle, speed, timestamp)
-            streaming_data.steering_data.append((
-                steering_angle,
-                speed,
-                frame.timestamp
-            ))
+        # 高频数据已在 main.py 的 _collect_highfreq_data 中收集到 streaming_data.chassis_highfreq
+        # 此处不再需要从 synced_frames 收集，避免重复和下采样
+        pass
     
     def compute_from_collected(self, streaming_data: StreamingData, **kwargs) -> List[KPIResult]:
         """
         从收集的数据计算转向平滑度KPI（流式模式）
+        
+        Note:
+            数据来源优先级：
+            1. 高频数据 (chassis_highfreq, ~50Hz) - 优先使用
+            2. 低频数据 (steering_data, ~10Hz) - 兼容旧模式/缓存模式
         """
         self.clear_results()
         
-        if len(streaming_data.steering_data) < int(self.window_duration_sec * self.sampling_rate_hz):
+        # 优先使用高频数据
+        if len(streaming_data.chassis_highfreq) > 0:
+            # 高频数据: (steering_angle, steering_vel, speed, lat_acc, timestamp)
+            # 过滤自动驾驶状态
+            auto_indices = [i for i, (is_auto, _) in enumerate(streaming_data.chassis_auto_states) 
+                           if is_auto and i < len(streaming_data.chassis_highfreq)]
+            
+            if len(auto_indices) > 0:
+                steering_angles = np.array([streaming_data.chassis_highfreq[i][0] for i in auto_indices])
+                speeds = np.array([streaming_data.chassis_highfreq[i][2] for i in auto_indices])
+                timestamps = np.array([streaming_data.chassis_highfreq[i][4] for i in auto_indices])
+            else:
+                # 没有自动驾驶数据
+                self._add_empty_results()
+                return self.get_results()
+        elif len(streaming_data.steering_data) > 0:
+            # 回退到低频数据（兼容缓存模式）
+            steering_angles = np.array([d[0] for d in streaming_data.steering_data])
+            speeds = np.array([d[1] for d in streaming_data.steering_data])
+            timestamps = np.array([d[2] for d in streaming_data.steering_data])
+        else:
             self._add_empty_results()
             return self.get_results()
         
-        # 解构数据
-        steering_angles = np.array([d[0] for d in streaming_data.steering_data])
-        speeds = np.array([d[1] for d in streaming_data.steering_data])
-        timestamps = np.array([d[2] for d in streaming_data.steering_data])
+        # 速度过滤
+        speed_mask = speeds >= self.min_speed_kmh
+        steering_angles = steering_angles[speed_mask]
+        speeds = speeds[speed_mask]
+        timestamps = timestamps[speed_mask]
+        
+        # 动态估计实际采样率
+        if len(timestamps) >= 2:
+            actual_fs = 1.0 / np.median(np.diff(timestamps))
+            actual_fs = max(1.0, min(actual_fs, 100.0))  # 限制在合理范围
+        else:
+            actual_fs = self.sampling_rate_hz
+        
+        if len(timestamps) < int(self.window_duration_sec * actual_fs):
+            self._add_empty_results()
+            return self.get_results()
         
         bag_mapper = BagTimeMapper(streaming_data.bag_infos)
         
         # 1. 信号预处理：对转角进行低通滤波
-        steering_angles_filtered = self._apply_lowpass_filter(
-            steering_angles, self.angle_filter_cutoff, self.sampling_rate_hz, order=2)
+        # 注意：滤波截止频率需 < Nyquist (actual_fs/2)，否则跳过滤波
+        angle_cutoff = min(self.angle_filter_cutoff, actual_fs / 2 - 0.1)
+        if angle_cutoff > 0:
+            steering_angles_filtered = self._apply_lowpass_filter(
+                steering_angles, angle_cutoff, actual_fs, order=2)
+        else:
+            steering_angles_filtered = steering_angles
         
         # 2. 计算转角速度（从滤波后的转角计算）
         ts_rate, steering_rates = SignalProcessor.compute_derivative(
@@ -252,14 +263,18 @@ class SteeringSmoothnessKPI(BaseKPI):
             return self.get_results()
         
         # 3. 对转角速度进行低通滤波
-        steering_rates_filtered = self._apply_lowpass_filter(
-            steering_rates, self.rate_filter_cutoff, self.sampling_rate_hz, order=2)
+        rate_cutoff = min(self.rate_filter_cutoff, actual_fs / 2 - 0.1)
+        if rate_cutoff > 0:
+            steering_rates_filtered = self._apply_lowpass_filter(
+                steering_rates, rate_cutoff, actual_fs, order=2)
+        else:
+            steering_rates_filtered = steering_rates
         
         # 4. 计算滑动窗口 RMS 并检测超阈值事件
         if self.rms_enabled:
             window_centers, rms_values = self._compute_sliding_window_rms(
                 np.abs(steering_rates_filtered), ts_rate,
-                self.window_duration_sec, self.window_step_sec)
+                self.window_duration_sec, self.window_step_sec, fs=actual_fs)
             
             if len(rms_values) > 0:
                 # 统计 RMS 指标
@@ -270,17 +285,64 @@ class SteeringSmoothnessKPI(BaseKPI):
                 # 将速度对齐到窗口中心时间戳
                 speeds_at_windows = np.interp(window_centers, timestamps, speeds)
                 
-                # 检测超阈值事件（fail级别）
-                rms_events = []
+                # 检测超阈值事件（fail级别）- 合并连续的超阈值窗口
+                # 过滤低速事件（< min_anomaly_speed_kmh）
+                rms_events_raw = []
                 for i, (rms_val, ts, spd) in enumerate(zip(rms_values, window_centers, speeds_at_windows)):
+                    # 低速过滤
+                    if spd < self.min_anomaly_speed_kmh:
+                        continue
                     fail_threshold = self._get_threshold('steering_rate_rms', spd, 'fail')
                     if fail_threshold > 0 and rms_val > fail_threshold:
-                        rms_events.append({
+                        rms_events_raw.append({
                             'timestamp': ts,
                             'value': rms_val,
                             'threshold': fail_threshold,
                             'speed': spd
                         })
+                
+                # 合并相邻的超阈值事件（时间间隔 < 1秒则合并为同一事件）
+                merge_gap = 1.0
+                rms_events = []
+                if len(rms_events_raw) > 0:
+                    current_event = {
+                        'start_ts': rms_events_raw[0]['timestamp'],
+                        'end_ts': rms_events_raw[0]['timestamp'],
+                        'peak_value': rms_events_raw[0]['value'],
+                        'peak_ts': rms_events_raw[0]['timestamp'],
+                        'threshold': rms_events_raw[0]['threshold'],
+                        'speed': rms_events_raw[0]['speed'],
+                        'count': 1
+                    }
+                    
+                    for i in range(1, len(rms_events_raw)):
+                        time_gap = rms_events_raw[i]['timestamp'] - rms_events_raw[i-1]['timestamp']
+                        
+                        if time_gap <= merge_gap:
+                            # 合并到当前事件
+                            current_event['end_ts'] = rms_events_raw[i]['timestamp']
+                            current_event['count'] += 1
+                            # 更新峰值
+                            if rms_events_raw[i]['value'] > current_event['peak_value']:
+                                current_event['peak_value'] = rms_events_raw[i]['value']
+                                current_event['peak_ts'] = rms_events_raw[i]['timestamp']
+                                current_event['threshold'] = rms_events_raw[i]['threshold']
+                                current_event['speed'] = rms_events_raw[i]['speed']
+                        else:
+                            # 保存当前事件，开始新事件
+                            rms_events.append(current_event)
+                            current_event = {
+                                'start_ts': rms_events_raw[i]['timestamp'],
+                                'end_ts': rms_events_raw[i]['timestamp'],
+                                'peak_value': rms_events_raw[i]['value'],
+                                'peak_ts': rms_events_raw[i]['timestamp'],
+                                'threshold': rms_events_raw[i]['threshold'],
+                                'speed': rms_events_raw[i]['speed'],
+                                'count': 1
+                            }
+                    
+                    # 保存最后一个事件
+                    rms_events.append(current_event)
                 
                 self.add_result(KPIResult(
                     name="转角速度RMS均值",
@@ -296,13 +358,14 @@ class SteeringSmoothnessKPI(BaseKPI):
                     description="滑动窗口内转角速度RMS的最大值"
                 )
                 
-                # 添加 RMS 超阈值事件
+                # 添加 RMS 超阈值事件（已合并）
                 for event in rms_events[:50]:  # 最多50个事件
+                    duration_sec = event['end_ts'] - event['start_ts']
                     rms_max_result.add_anomaly(
-                        timestamp=event['timestamp'],
-                        bag_name=bag_mapper.get_bag_name(event['timestamp']),
-                        description=f"转角速度RMS超阈值@{event['speed']:.0f}km/h: {event['value']:.1f}>{event['threshold']:.0f}°/s",
-                        value=event['value'],
+                        timestamp=event['peak_ts'],
+                        bag_name=bag_mapper.get_bag_name(event['peak_ts']),
+                        description=f"转角速度RMS超阈值@{event['speed']:.0f}km/h: 峰值{event['peak_value']:.1f}>{event['threshold']:.0f}°/s, 持续{duration_sec:.1f}s",
+                        value=event['peak_value'],
                         threshold=event['threshold']
                     )
                 
@@ -372,8 +435,14 @@ class SteeringSmoothnessKPI(BaseKPI):
                 description="转角速度绝对值的95分位数"
             )
             
-            # 添加 P95 超阈值事件
-            for event in p95_events[:50]:  # 最多50个事件
+            # 添加 P95 超阈值事件（过滤低速）
+            added_count = 0
+            for event in p95_events:
+                # 低速过滤
+                if event['avg_speed'] < self.min_anomaly_speed_kmh:
+                    continue
+                if added_count >= 50:  # 最多50个事件
+                    break
                 duration_ms = (event['end_ts'] - event['start_ts']) * 1000
                 p95_result.add_anomaly(
                     timestamp=event['start_ts'],
@@ -382,6 +451,7 @@ class SteeringSmoothnessKPI(BaseKPI):
                     value=event['peak_value'],
                     threshold=event['threshold']
                 )
+                added_count += 1
             
             self.add_result(p95_result)
         
@@ -403,8 +473,8 @@ class SteeringSmoothnessKPI(BaseKPI):
             
             # 如果全局翻转率超阈值，找出翻转率最高的时间段
             if fail_threshold > 0 and flip_rate > fail_threshold:
-                window_size = int(self.window_duration_sec * self.sampling_rate_hz)
-                step_size = int(self.window_step_sec * self.sampling_rate_hz)
+                window_size = int(self.window_duration_sec * actual_fs)
+                step_size = int(self.window_step_sec * actual_fs)
                 
                 # 计算每个窗口的翻转率
                 flip_events = []

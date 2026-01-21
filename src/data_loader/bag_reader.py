@@ -13,6 +13,144 @@ from rosbags.rosbag2 import Reader
 from rosbags.typesys import Stores, get_typestore, get_types_from_msg
 from tqdm import tqdm
 
+# ============================================================================
+# Monkey patch: 修复 rosbags 对 'cdr' 编码格式的支持
+# rosbags 0.11.0 在 storage_sqlite3.py 第94行有断言 assert typ['encoding'] == 'ros2msg'
+# 但 ROS2 bag 文件可能使用 'cdr' 编码（这是 ROS2 的标准序列化格式）
+# 我们通过替换 get_types_from_msg 来绕过这个断言
+# ============================================================================
+try:
+    from rosbags.rosbag2 import storage_sqlite3
+    from rosbags.typesys.msg import get_types_from_msg as _original_get_types
+    
+    # 保存原始的 open 方法
+    _original_sqlite3_open = storage_sqlite3.Sqlite3Reader.open
+    
+    def _patched_sqlite3_open(self):
+        """Patched open method to support 'cdr' encoding in message_definitions"""
+        import sqlite3
+        from typing import cast
+        from rosbags.interfaces import Connection, MessageDefinition, MessageDefinitionFormat, ConnectionExtRosbag2
+        from rosbags.typesys.store import Typestore
+        from rosbags.rosbag2.metadata import parse_qos
+        
+        conn = sqlite3.connect(f'file:{self.path}?immutable=1', uri=True)
+        conn.row_factory = lambda _, x: x
+        cur = conn.cursor()
+        _ = cur.execute(
+            'SELECT count(*) FROM sqlite_master WHERE type="table" AND name IN ("messages", "topics")'
+        )
+        if cur.fetchone()[0] != 2:
+            conn.close()
+            raise Exception(f'Cannot open database {self.path}')
+        
+        self.dbconn = conn
+        
+        cur = conn.cursor()
+        if cur.execute('PRAGMA table_info(schema)').fetchall():
+            (schema,) = cur.execute('SELECT schema_version FROM schema').fetchone()
+        elif any(x[1] == 'offered_qos_profiles' for x in cur.execute('PRAGMA table_info(topics)')):
+            schema = 2
+        else:
+            schema = 1
+        
+        self.schema = schema
+        
+        if schema >= 4:
+            msgtypes = [
+                {'name': x[0], 'encoding': x[1], 'msgdef': x[2], 'digest': x[3]}
+                for x in cur.execute(
+                    'SELECT topic_type, encoding, encoded_message_definition, type_description_hash '
+                    'FROM message_definitions ORDER BY id'
+                )
+            ]
+            # 修复：允许 'cdr' / 空字符串 编码，将其视为 'ros2msg' 处理
+            # 某些工具生成的 bag 文件可能 encoding 字段为空
+            for typ in msgtypes:
+                if typ['encoding'] not in ('ros2msg', 'cdr', ''):
+                    raise Exception(f"Unsupported encoding: {typ['encoding']}")
+                # 跳过验证：cdr 或空编码没有有效的 msgdef
+                if typ['encoding'] in ('cdr', '') or not typ['msgdef']:
+                    continue
+                try:
+                    types = _original_get_types(typ['msgdef'], typ['name'])
+                    store = Typestore()
+                    store.register(types)
+                except Exception:
+                    pass  # 忽略解析错误
+        else:
+            msgtypes = []
+        
+        self.msgtypes = msgtypes
+        
+        def get_msgdef(name):
+            fmtmap = {'ros2msg': MessageDefinitionFormat.MSG, 'ros2idl': MessageDefinitionFormat.IDL, 'cdr': MessageDefinitionFormat.MSG}
+            if msgtype := next((x for x in msgtypes if x['name'] == name), None):
+                return MessageDefinition(fmtmap.get(msgtype['encoding'], MessageDefinitionFormat.NONE), msgtype.get('msgdef', ''))
+            return MessageDefinition(MessageDefinitionFormat.NONE, '')
+        
+        # Connection 签名: (id, topic, msgtype, msgdef, digest, msgcount, ext, owner)
+        if schema >= 4:
+            self.connections = [
+                Connection(
+                    cid, topic, msgtype,
+                    get_msgdef(msgtype),
+                    '',  # digest
+                    msgcount,
+                    ConnectionExtRosbag2(serialization_format, parse_qos(qos)),
+                    None,  # owner
+                )
+                for cid, topic, msgtype, serialization_format, qos, msgcount in cur.execute(
+                    'SELECT topics.id, name, type, serialization_format, offered_qos_profiles, count(*) '
+                    'FROM topics LEFT JOIN messages ON topics.id = messages.topic_id GROUP BY topics.id ORDER BY topics.id'
+                )
+            ]
+        elif schema >= 2:
+            self.connections = [
+                Connection(
+                    cid, topic, msgtype,
+                    get_msgdef(msgtype),
+                    '',  # digest
+                    msgcount,
+                    ConnectionExtRosbag2(serialization_format, parse_qos(qos)),
+                    None,  # owner
+                )
+                for cid, topic, msgtype, serialization_format, qos, msgcount in cur.execute(
+                    'SELECT topics.id, name, type, serialization_format, offered_qos_profiles, count(*) '
+                    'FROM topics LEFT JOIN messages ON topics.id = messages.topic_id GROUP BY topics.id ORDER BY topics.id'
+                )
+            ]
+        else:
+            self.connections = [
+                Connection(
+                    cid, topic, msgtype,
+                    get_msgdef(msgtype),
+                    '',  # digest
+                    msgcount,
+                    ConnectionExtRosbag2(serialization_format, []),
+                    None,  # owner
+                )
+                for cid, topic, msgtype, serialization_format, msgcount in cur.execute(
+                    'SELECT topics.id, name, type, serialization_format, count(*) '
+                    'FROM topics LEFT JOIN messages ON topics.id = messages.topic_id GROUP BY topics.id ORDER BY topics.id'
+                )
+            ]
+        
+        # Get metadata
+        rows = list(cur.execute('SELECT timestamp FROM messages ORDER BY timestamp LIMIT 1'))
+        start = rows[0][0] if rows else 0
+        rows = list(cur.execute('SELECT timestamp FROM messages ORDER BY timestamp DESC LIMIT 1'))
+        end = rows[0][0] if rows else 0
+        (count,) = cur.execute('SELECT count(*) FROM messages').fetchone()
+        
+        from rosbags.rosbag2.metadata import ReaderMetadata
+        self.metadata = ReaderMetadata(start, end, count, 0, None, None, None, None)
+    
+    storage_sqlite3.Sqlite3Reader.open = _patched_sqlite3_open
+    
+except Exception as e:
+    pass  # 如果补丁失败，继续使用原始实现
+
 # 尝试导入ROS2序列化模块和自定义消息类型
 RCLPY_AVAILABLE = False
 HV_MSG_CLASSES = {}
@@ -62,6 +200,18 @@ try:
     HV_MSG_CLASSES['hv_planning_msgs/msg/PathPoint'] = PathPoint
 except ImportError as e:
     print(f"Error importing hv_planning_msgs/msg/Trajectory or hv_planning_msgs/msg/PathPoint: {e}")
+    pass
+
+try:
+    from hv_planning_msgs.msg import PlanningDebug
+    HV_MSG_CLASSES['hv_planning_msgs/msg/PlanningDebug'] = PlanningDebug
+except ImportError:
+    pass
+
+try:
+    from hv_map_msgs.msg import Map
+    HV_MSG_CLASSES['hv_map_msgs/msg/Map'] = Map
+except ImportError:
     pass
 
 if HV_MSG_CLASSES:
@@ -154,14 +304,18 @@ class BagReader:
     
     def _ensure_metadata_exists(self):
         """
-        确保 metadata.yaml 存在
-        如果目录中只有 .db3 文件而没有 metadata.yaml，则自动生成一个
+        确保 metadata.yaml 存在且有效
+        如果目录中只有 .db3 文件而没有 metadata.yaml（或文件为空），则自动生成一个
         会从 db3 文件中读取 topics 信息
         """
         metadata_path = self.bag_path / "metadata.yaml"
         
+        # 检查文件是否存在且非空
         if metadata_path.exists():
-            return  # 已存在，无需生成
+            if metadata_path.stat().st_size > 0:
+                return  # 已存在且非空，无需生成
+            else:
+                print(f"  [WARN] metadata.yaml 存在但为空，将重新生成...")
         
         # 查找目录中的 .db3 文件
         db3_files = sorted(self.bag_path.glob("*.db3"))

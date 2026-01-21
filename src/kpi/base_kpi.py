@@ -80,10 +80,16 @@ class AnomalyRecord:
     end_timestamp: float = 0  # 事件结束时间戳（用于连续帧事件）
     frame_count: int = 1      # 连续帧数量
     peak_value: Any = None    # 峰值（连续帧中的最大/最小值）
+    scene: Optional[Dict] = None  # 场景信息 {scene, in_junction, turn_type, turn_name}
     
     def to_dict(self) -> Dict:
+        from datetime import datetime
+        # 转换为可读时间格式
+        time_str = datetime.fromtimestamp(self.timestamp).strftime('%Y-%m-%d %H:%M:%S')
+        
         result = {
             'timestamp': self.timestamp,
+            'time': time_str,
             'frame_idx': self.frame_idx,
             'bag_name': self.bag_name,
             'description': self.description,
@@ -92,11 +98,14 @@ class AnomalyRecord:
         }
         if self.end_timestamp > 0:
             result['end_timestamp'] = self.end_timestamp
+            result['end_time'] = datetime.fromtimestamp(self.end_timestamp).strftime('%Y-%m-%d %H:%M:%S')
             result['duration'] = round(self.end_timestamp - self.timestamp, 3)
         if self.frame_count > 1:
             result['frame_count'] = self.frame_count
         if self.peak_value is not None:
             result['peak_value'] = self.peak_value
+        if self.scene is not None:
+            result['scene'] = self.scene
         return result
 
 
@@ -365,6 +374,10 @@ class StreamingData:
     
     用于收集多个 bag 的原始数据，最后统一计算 KPI。
     这样可以保证流式模式与普通模式计算结果一致。
+    
+    数据分类：
+    1. 低频数据（10Hz 同步帧）：里程、接管、定位等
+    2. 高频数据（原始频率）：转向、舒适性、画龙等需要高频信号的 KPI
     """
     # ========== 里程统计 ==========
     # 位置序列 [(lat, lon, is_auto, timestamp), ...]
@@ -423,6 +436,34 @@ class StreamingData:
     # {timestamp: {key: value}}
     parsed_debug_data: Dict = field(default_factory=dict)
     
+    # ========== Planning 调试数据 ==========
+    # [(present_status, trajectory_type, is_replan, timestamp), ...]
+    planning_debug_data: List[tuple] = field(default_factory=list)
+    
+    # ========== 场景检测数据 ==========
+    # /map/map 的 lanes 信息: [{'lane_id': str, 'turn': int, 'junction_id': str, 'type': int}, ...]
+    map_lanes_data: List[Dict] = field(default_factory=list)
+    
+    # /planning/trajectory 的 lane_id 序列: [(lane_ids: List[str], timestamp), ...]
+    trajectory_lane_ids: List[tuple] = field(default_factory=list)
+    
+    # ========== 高频原始数据（直接从 topic 读取，不经过同步下采样）==========
+    # 底盘高频数据 (理论 ~50Hz，实际可能更低): [(steering_angle, steering_vel, speed, lat_acc, timestamp), ...]
+    # 用于：转向平滑度、画龙检测、横向猛打
+    # 注意：实际采样率需在 compute_from_collected 中动态估计
+    chassis_highfreq: List[tuple] = field(default_factory=list)
+    
+    # 控制高频数据 (理论 ~50Hz，实际可能更低): [(lon_acc, timestamp), ...]
+    # 用于：舒适性(jerk)、急减速
+    # 注意：实际采样率需在 compute_from_collected 中动态估计
+    control_highfreq: List[tuple] = field(default_factory=list)
+    
+    # 高频数据对应的自动驾驶状态（从 func 插值）
+    # [(is_auto, timestamp), ...] - 与 chassis_highfreq 对齐
+    chassis_auto_states: List[tuple] = field(default_factory=list)
+    # [(is_auto, timestamp), ...] - 与 control_highfreq 对齐
+    control_auto_states: List[tuple] = field(default_factory=list)
+    
     def merge(self, other: 'StreamingData'):
         """合并另一个 StreamingData 的数据"""
         self.positions.extend(other.positions)
@@ -441,6 +482,16 @@ class StreamingData:
         self.speeding_data.extend(other.speeding_data)
         self.bag_infos.extend(other.bag_infos)
         self.parsed_debug_data.update(other.parsed_debug_data)
+        self.planning_debug_data.extend(other.planning_debug_data)
+        # 场景检测数据
+        if other.map_lanes_data and not self.map_lanes_data:
+            self.map_lanes_data = other.map_lanes_data  # 只保留一份 map lanes 数据
+        self.trajectory_lane_ids.extend(other.trajectory_lane_ids)
+        # 高频数据
+        self.chassis_highfreq.extend(other.chassis_highfreq)
+        self.control_highfreq.extend(other.control_highfreq)
+        self.chassis_auto_states.extend(other.chassis_auto_states)
+        self.control_auto_states.extend(other.control_auto_states)
     
     def sort_by_timestamp(self):
         """按时间戳排序所有数据"""
@@ -478,6 +529,25 @@ class StreamingData:
         # speeding_data: (speed, speed_limit, lat, lon, is_auto, timestamp) - 索引 5
         if self.speeding_data:
             self.speeding_data.sort(key=lambda x: x[5])
+        # 高频数据
+        # chassis_highfreq: (steering_angle, steering_vel, speed, lat_acc, timestamp) - 索引 4
+        if self.chassis_highfreq:
+            self.chassis_highfreq.sort(key=lambda x: x[4])
+        # control_highfreq: (lon_acc, timestamp) - 索引 1
+        if self.control_highfreq:
+            self.control_highfreq.sort(key=lambda x: x[1])
+        # chassis_auto_states: (is_auto, timestamp) - 索引 1
+        if self.chassis_auto_states:
+            self.chassis_auto_states.sort(key=lambda x: x[1])
+        # control_auto_states: (is_auto, timestamp) - 索引 1
+        if self.control_auto_states:
+            self.control_auto_states.sort(key=lambda x: x[1])
+        # planning_debug_data: (present_status, trajectory_type, is_replan, timestamp) - 索引 3
+        if self.planning_debug_data:
+            self.planning_debug_data.sort(key=lambda x: x[3])
+        # trajectory_lane_ids: (lane_ids, timestamp) - 索引 1
+        if self.trajectory_lane_ids:
+            self.trajectory_lane_ids.sort(key=lambda x: x[1])
     
     def clear(self):
         """清空所有数据"""
@@ -497,6 +567,15 @@ class StreamingData:
         self.speeding_data.clear()
         self.bag_infos.clear()
         self.parsed_debug_data.clear()
+        self.planning_debug_data.clear()
+        # 场景检测数据
+        self.map_lanes_data.clear()
+        self.trajectory_lane_ids.clear()
+        # 高频数据
+        self.chassis_highfreq.clear()
+        self.control_highfreq.clear()
+        self.chassis_auto_states.clear()
+        self.control_auto_states.clear()
     
     def get_stats(self) -> Dict:
         """获取数据统计信息"""
@@ -512,7 +591,11 @@ class StreamingData:
             'roi_data': len(self.roi_data),
             'emergency_data': len(self.emergency_data),
             'bags': len(self.bag_infos),
-            'debug_timestamps': len(self.parsed_debug_data)
+            'debug_timestamps': len(self.parsed_debug_data),
+            'planning_debug_data': len(self.planning_debug_data),
+            # 高频数据统计
+            'chassis_highfreq': len(self.chassis_highfreq),
+            'control_highfreq': len(self.control_highfreq),
         }
 
 
