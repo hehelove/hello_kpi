@@ -13,6 +13,8 @@ compile_proto.py
 scripts/
 docs/
 tests/
+ARCHITECTURE.md
+metrics.md
 
 # Virtual environments
 venv/
