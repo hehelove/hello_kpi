@@ -134,6 +134,20 @@ class EmergencyEventsKPI(BaseKPI):
             pass
         return -3.0  # 默认阈值
     
+    def _get_deceleration_thresholds_vectorized(self, speeds: np.ndarray) -> np.ndarray:
+        """向量化获取减速度阈值（性能优化）"""
+        thresholds = np.full(len(speeds), -3.0, dtype=np.float64)  # 默认值
+        try:
+            ranges = self.comfort_config.get('longitudinal_deceleration', {}).get('ranges', [])
+            for r in ranges:
+                speed_range = r.get('speed_kph', [0, 999])
+                fail_val = -r.get('fail', 3.0)
+                mask = (speeds >= speed_range[0]) & (speeds < speed_range[1])
+                thresholds[mask] = fail_val
+        except Exception:
+            pass
+        return thresholds
+    
     def _detect_hard_braking(self, 
                               timestamps: np.ndarray,
                               accelerations: np.ndarray,
@@ -151,15 +165,9 @@ class EmergencyEventsKPI(BaseKPI):
         # 时间跳跃阈值：超过此值认为是不同的时间段
         max_gap = 0.5  # 0.5 秒
         
-        # 逐点判断是否超过速度相关阈值
-        over_threshold_mask = np.zeros(len(accelerations), dtype=bool)
-        thresholds_used = []
-        
-        for i, (acc, spd) in enumerate(zip(accelerations, speeds)):
-            threshold = self._get_deceleration_threshold(spd)
-            thresholds_used.append(threshold)
-            if acc < threshold:  # 减速度为负值，小于阈值表示更急
-                over_threshold_mask[i] = True
+        # 向量化判断是否超过速度相关阈值（性能优化）
+        thresholds_used = self._get_deceleration_thresholds_vectorized(speeds)
+        over_threshold_mask = accelerations < thresholds_used  # 减速度为负值，小于阈值表示更急
         
         # 检测连续超阈值事件（考虑时间跳跃）
         in_event = False
@@ -237,6 +245,20 @@ class EmergencyEventsKPI(BaseKPI):
             pass
         return 2.5  # 默认阈值
     
+    def _get_jerk_thresholds_vectorized(self, speeds: np.ndarray) -> np.ndarray:
+        """向量化获取 jerk 阈值（性能优化）"""
+        thresholds = np.full(len(speeds), 2.5, dtype=np.float64)  # 默认值
+        try:
+            ranges = self.comfort_config.get('longitudinal_jerk', {}).get('peak', {}).get('ranges', [])
+            for r in ranges:
+                speed_range = r.get('speed_kph', [0, 999])
+                thresh_val = r.get('threshold', 2.5)
+                mask = (speeds >= speed_range[0]) & (speeds < speed_range[1])
+                thresholds[mask] = thresh_val
+        except Exception:
+            pass
+        return thresholds
+    
     def _detect_jerk_events(self,
                              timestamps: np.ndarray,
                              accelerations: np.ndarray,
@@ -260,20 +282,12 @@ class EmergencyEventsKPI(BaseKPI):
         if len(jerks) == 0:
             return events
         
-        # 将 speeds 对齐到 jerk 时间戳（使用最近的速度值）
-        jerk_speeds = np.zeros(len(ts_jerk))
-        for i, ts_j in enumerate(ts_jerk):
-            # 找到最近的速度时间戳
-            closest_idx = np.argmin(np.abs(timestamps - ts_j))
-            jerk_speeds[i] = speeds[closest_idx] if closest_idx < len(speeds) else speeds[-1]
+        # 将 speeds 对齐到 jerk 时间戳（使用插值，O(n) 复杂度）
+        jerk_speeds = np.interp(ts_jerk, timestamps, speeds)
         
-        # 逐点判断是否超过速度相关阈值
-        over_threshold_mask = np.zeros(len(jerks), dtype=bool)
-        
-        for i, (jerk_val, spd) in enumerate(zip(jerks, jerk_speeds)):
-            threshold = self._get_jerk_threshold(spd)
-            if abs(jerk_val) > threshold:
-                over_threshold_mask[i] = True
+        # 向量化判断是否超过速度相关阈值（性能优化）
+        jerk_thresholds = self._get_jerk_thresholds_vectorized(jerk_speeds)
+        over_threshold_mask = np.abs(jerks) > jerk_thresholds
         
         # 检测连续超阈值事件（考虑时间跳跃）
         in_event = False
@@ -410,7 +424,7 @@ class EmergencyEventsKPI(BaseKPI):
         max_gap = 0.5  # 0.5 秒
         
         # ========== 1. 转角速度超限检测 ==========
-        vel_thresholds = np.array([self._get_lateral_threshold(s) for s in speeds])
+        vel_thresholds = self._get_lateral_thresholds_vectorized(speeds)
         vel_over_threshold = np.abs(steering_velocities) > vel_thresholds
         
         # 找连续区间（考虑时间跳跃）
@@ -467,7 +481,7 @@ class EmergencyEventsKPI(BaseKPI):
         if len(steering_acc) > 0:
             # 对应的速度（插值）
             speeds_at_acc = np.interp(ts_acc, timestamps, speeds)
-            acc_thresholds = np.array([self._get_steering_acc_threshold(s) for s in speeds_at_acc])
+            acc_thresholds = self._get_steering_acc_thresholds_vectorized(speeds_at_acc)
             acc_over_threshold = np.abs(steering_acc) > acc_thresholds
             
             in_event = False
@@ -566,6 +580,17 @@ class EmergencyEventsKPI(BaseKPI):
         
         return self.lateral_speed_thresholds.get(0, 200)
     
+    def _get_lateral_thresholds_vectorized(self, speeds: np.ndarray) -> np.ndarray:
+        """向量化获取转角速度阈值（性能优化）"""
+        thresholds = np.full(len(speeds), self.lateral_speed_thresholds.get(0, 200), dtype=np.float64)
+        sorted_speeds = sorted(self.lateral_speed_thresholds.keys())  # 升序
+        
+        for thresh_speed in sorted_speeds:
+            mask = speeds >= thresh_speed
+            thresholds[mask] = self.lateral_speed_thresholds[thresh_speed]
+        
+        return thresholds
+    
     def _get_steering_acc_threshold(self, speed_kmh: float) -> float:
         """根据速度获取转角加速度阈值"""
         sorted_speeds = sorted(self.steering_acc_thresholds.keys(), reverse=True)
@@ -575,6 +600,17 @@ class EmergencyEventsKPI(BaseKPI):
                 return self.steering_acc_thresholds[threshold_speed]
         
         return self.steering_acc_thresholds.get(0, 600)
+    
+    def _get_steering_acc_thresholds_vectorized(self, speeds: np.ndarray) -> np.ndarray:
+        """向量化获取转角加速度阈值（性能优化）"""
+        thresholds = np.full(len(speeds), self.steering_acc_thresholds.get(0, 600), dtype=np.float64)
+        sorted_speeds = sorted(self.steering_acc_thresholds.keys())  # 升序
+        
+        for thresh_speed in sorted_speeds:
+            mask = speeds > thresh_speed
+            thresholds[mask] = self.steering_acc_thresholds[thresh_speed]
+        
+        return thresholds
     
     @property
     def supports_streaming(self) -> bool:

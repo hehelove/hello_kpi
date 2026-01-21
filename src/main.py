@@ -8,8 +8,9 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Callable, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import multiprocessing
 
 import yaml
 
@@ -39,6 +40,36 @@ from src.constants import KPINames, KPIStatus, Topics, ConfigKeys
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+def _read_bag_worker(args: tuple) -> tuple:
+    """
+    多进程 worker：读取单个 bag 文件
+    
+    Args:
+        args: (bag_path_str, topics_to_read, idx)
+        
+    Returns:
+        (idx, topic_data_dict, error_msg)
+        topic_data_dict: {topic: {'timestamps': [...], 'messages': [...]}}
+    """
+    bag_path_str, topics_to_read, idx = args
+    try:
+        from src.data_loader import BagReader
+        reader = BagReader(bag_path_str)
+        topic_data = reader.read_topics(topics_to_read, progress=False, light_mode=True)
+        
+        # 转换为可序列化的字典格式
+        result = {}
+        for topic, td in topic_data.items():
+            result[topic] = {
+                'timestamps': list(td.timestamps),
+                'messages': list(td.messages)  # 轻量级消息已经是简单对象
+            }
+        return (idx, result, None)
+    except Exception as e:
+        import traceback
+        return (idx, None, f"{e}\n{traceback.format_exc()}")
 
 
 @dataclass
@@ -1163,6 +1194,8 @@ class KPIAnalyzer:
         
         处理后的同步帧数保存在 self._last_synced_frame_count
         """
+        t0 = time.perf_counter()
+        
         # 解析控制调试数据
         debug_topic = Topics.CONTROL_DEBUG
         if debug_topic in topic_data:
@@ -1172,6 +1205,8 @@ class KPIAnalyzer:
             parsed = self.control_parser.batch_parse(topic.messages, topic.timestamps)
             global_parsed_debug_data.update(parsed)
         
+        t1 = time.perf_counter()
+        
         # 记录高频数据和 planning debug 数据起始位置（用于缓存写入）
         chassis_start_idx = len(streaming_data.chassis_highfreq)
         control_start_idx = len(streaming_data.control_highfreq)
@@ -1180,14 +1215,17 @@ class KPIAnalyzer:
         # 收集高频原始数据（在同步之前，保留完整频率）
         self._collect_highfreq_data(topic_data, streaming_data)
         
+        t2 = time.perf_counter()
+        
         # 时间同步（10Hz，用于低频 KPI）
         synced_frames = self._synchronize_single_bag_data(topic_data)
+        
+        t3 = time.perf_counter()
         
         # 计算本次新增的高频数据量
         chassis_new_count = len(streaming_data.chassis_highfreq) - chassis_start_idx
         control_new_count = len(streaming_data.control_highfreq) - control_start_idx
         planning_debug_new_count = len(streaming_data.planning_debug_data) - planning_debug_start_idx
-        print(f"      同步帧数: {len(synced_frames)}, 高频: chassis=+{chassis_new_count:,}, control=+{control_new_count:,}, planning_debug=+{planning_debug_new_count:,}")
         
         self._last_synced_frame_count = len(synced_frames)
         
@@ -1215,13 +1253,24 @@ class KPIAnalyzer:
                     item_name
                 )
         
+        t4 = time.perf_counter()
+        
         # 直接调用所有 KPI 的 collect（核心优化点！）
+        kpi_times = {}
         for kpi in streaming_kpis:
             try:
+                kpi_start = time.perf_counter()
                 kpi.collect(synced_frames, streaming_data,
                            parsed_debug_data=global_parsed_debug_data)
+                kpi_times[kpi.name] = time.perf_counter() - kpi_start
             except Exception:
                 pass
+        
+        t5 = time.perf_counter()
+        
+        # 输出处理耗时分析
+        kpi_detail = ", ".join(f"{k[:4]}={v:.1f}" for k, v in sorted(kpi_times.items(), key=lambda x: -x[1])[:3])
+        print(f"      帧数: {len(synced_frames)}, 耗时: 解析={t1-t0:.1f}s, 收集={t2-t1:.1f}s, 同步={t3-t2:.1f}s, 缓存={t4-t3:.1f}s, KPI={t5-t4:.1f}s ({kpi_detail})")
         
         # 清理同步帧（内存优化）
         synced_frames.clear()
@@ -1561,67 +1610,113 @@ class KPIAnalyzer:
             
             failed_bags = []  # 记录失败的 bag
             
-            # ===== 并行读取优化 =====
-            # 使用预读取：在处理当前 bag 时并行读取下 N 个 bag
-            prefetch_count = max(1, min(parallel_bags, 4))  # 最多预读取 4 个
+            # ===== 真正的流水线：读取和处理并行 =====
+            worker_count = max(1, min(parallel_bags, multiprocessing.cpu_count()))
             
-            def read_bag_data(item_path_str: str):
-                """读取单个 bag 的数据（用于并行）"""
-                try:
-                    reader = BagReader(item_path_str)
-                    data = reader.read_topics(topics_to_read, progress=False, light_mode=True)
-                    return data, None
-                except Exception as e:
-                    return None, str(e)
-            
-            if prefetch_count > 1 and total_items > 1:
-                print(f"\n  [并行模式] 预读取 {prefetch_count} 个 bag")
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+            if worker_count > 1 and total_items > 1:
+                print(f"\n  [真流水线] 使用 {worker_count} 个进程，读取和处理并行")
                 
-                # 使用线程池预读取
-                with ThreadPoolExecutor(max_workers=prefetch_count) as executor:
-                    # 提交所有读取任务
-                    future_to_idx = {}
-                    for idx, (item_path, _) in enumerate(iterate_items):
-                        future = executor.submit(read_bag_data, str(item_path))
-                        future_to_idx[future] = idx
-                    
-                    # 收集结果（按提交顺序）
-                    results_cache = {}
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        results_cache[idx] = future.result()
-                    
-                    # 按顺序处理结果
-                    for item_idx in range(total_items):
-                        item_path, bag_info_obj = iterate_items[item_idx]
-                        item_name = Path(item_path).name
-                        print(f"\n  [{item_idx+1}/{total_items}] 处理: {item_name}")
+                import platform
+                if platform.system() == 'Linux':
+                    ctx = multiprocessing.get_context('forkserver')
+                else:
+                    ctx = multiprocessing.get_context('spawn')
+                
+                from src.data_loader.bag_reader import TopicData
+                from queue import Queue
+                from threading import Thread
+                
+                # 结果队列：存放已读取的数据
+                result_queue = Queue(maxsize=worker_count * 2)  # 缓冲区
+                read_done = [False]  # 读取完成标志
+                
+                def reader_thread():
+                    """后台读取线程"""
+                    with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
+                        # 提交所有读取任务
+                        futures = {}
+                        for idx, (item_path, _) in enumerate(iterate_items):
+                            task = (str(item_path), topics_to_read, idx)
+                            future = executor.submit(_read_bag_worker, task)
+                            futures[future] = idx
                         
-                        topic_data, error = results_cache[item_idx]
+                        # 按完成顺序放入队列
+                        for future in as_completed(futures):
+                            result = future.result()
+                            result_queue.put(result)
+                    
+                    read_done[0] = True
+                
+                # 启动后台读取线程
+                reader = Thread(target=reader_thread, daemon=True)
+                reader.start()
+                
+                # 主线程：边接收边处理
+                results_cache = {}
+                processed = 0
+                read_count = 0
+                
+                while processed < total_items:
+                    # 尝试接收已读取的数据
+                    while not result_queue.empty() or (not read_done[0] and len(results_cache) < worker_count * 2):
+                        try:
+                            idx, data_dict, error = result_queue.get(timeout=0.1)
+                            results_cache[idx] = (data_dict, error)
+                            read_count += 1
+                            item_name = Path(iterate_items[idx][0]).name
+                            if error:
+                                print(f"    [读取 {read_count}/{total_items}] ✗ {item_name}")
+                            else:
+                                msg_count = sum(len(d['messages']) for d in data_dict.values())
+                                print(f"    [读取 {read_count}/{total_items}] ✓ {item_name} ({msg_count:,} 条)")
+                        except:
+                            break
+                    
+                    # 按顺序处理（如果当前需要的数据已经读取完成）
+                    while processed in results_cache:
+                        item_path, bag_info_obj = iterate_items[processed]
+                        item_name = Path(item_path).name
+                        
+                        data_dict, error = results_cache.pop(processed)
+                        
                         if error:
-                            print(f"      [错误] 读取失败: {error}")
+                            print(f"  [{processed+1}/{total_items}] ✗ 处理失败: {error[:50]}")
                             failed_bags.append((item_name, error))
+                            processed += 1
                             continue
                         
-                        msg_count = sum(len(td.messages) for td in topic_data.values())
-                        print(f"      读取消息: {msg_count:,} 条")
+                        # 将字典格式转换回 TopicData
+                        topic_data = {}
+                        for topic, d in data_dict.items():
+                            td = TopicData(topic_name=topic)
+                            td.timestamps = d['timestamps']
+                            td.messages = d['messages']
+                            topic_data[topic] = td
                         
-                        # 处理数据（与原逻辑相同）
+                        # 处理数据
+                        print(f"  [{processed+1}/{total_items}] 处理: {item_name}")
                         self._process_single_bag_streaming(
-                            topic_data, item_name, item_idx, total_items,
+                            topic_data, item_name, processed, total_items,
                             streaming_data, streaming_kpis, global_parsed_debug_data,
                             disk_store
                         )
                         total_frames += self._last_synced_frame_count
                         
                         # 释放内存
+                        del data_dict
                         for td in topic_data.values():
                             td.clear()
                         topic_data.clear()
-                        gc.collect()
                         
-                        self._log_memory(f"[{item_idx+1}/{total_items}] 处理后")
+                        processed += 1
+                        gc.collect()
+                    
+                    # 如果没有数据可处理，等待读取
+                    if processed not in results_cache and not read_done[0]:
+                        time.sleep(0.1)
+                
+                # 等待读取线程结束
+                reader.join(timeout=5)
             else:
                 # 原始单线程模式
                 for item_idx, (item_path, bag_info_obj) in enumerate(iterate_items):
@@ -2447,8 +2542,8 @@ def main():
                         help='并行计算KPI的线程数 (默认: 8)')
     parser.add_argument('-p', '--parallel-bags',
                         type=int,
-                        default=1,
-                        help='并行读取bag数量，用于加速流式模式 (默认: 1单线程，建议32G内存设为4-6)')
+                        default=4,
+                        help='多进程并行读取bag数量 (默认: 4，建议设为 CPU 核数的一半)')
     parser.add_argument('--no-cache',
                         action='store_true',
                         help='禁用持久化缓存')
